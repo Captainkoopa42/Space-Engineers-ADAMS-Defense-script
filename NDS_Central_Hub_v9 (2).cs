@@ -13,6 +13,13 @@
 //   Alpha Base=GPS:Alpha Base:1000:2000:3000:
 //   Bravo Fleet=GPS:Bravo Fleet:4000:5000:6000:
 //
+// SAVED SETTINGS — edit in CustomData under [Settings] section:
+//   [Settings]
+//   DefaultType=Nuke
+//   DefaultSalvo=2
+//   ParallelLimit=3
+//   (Settings are now auto-saved when changed via menu)
+//
 // STRIKE PACKAGES — two sources, merged automatically:
 //   1. Built-in defaults (edit STRIKE_TEMPLATES below)
 //   2. LCD-defined packages — name any text panel:
@@ -138,7 +145,7 @@ IMyUnicastListener ndsListener;
 int tickCounter      = 0;
 int messageIdCounter = 0;
 const int BROADCAST_INTERVAL = 300;
-const int STALE_TIMEOUT      = 1800;
+const int STALE_TIMEOUT      = 3600;  // UPDATED: Increased from 1800 to 3600 ticks (60 seconds)
 
 
 // ── MISSION MODEL ─────────────────────────────────────
@@ -220,8 +227,10 @@ public Program()
     Runtime.UpdateFrequency = UpdateFrequency.Update10;
     ndsListener = IGC.UnicastListener;
     LoadSavedTargets();
+    LoadSavedSettings();  // NEW: Load settings from CustomData
     ScanForPackages();
     Echo($"Hub {hubId} online. {savedTargets.Count} saved targets, {packageNames.Count} strike packages.");
+    Echo($"Settings loaded: Type={defaultType}, Salvo={defaultSalvoSize}, Limit={dispatchParallelLimit}");
 }
 
 public void Main(string argument, UpdateType updateSource)
@@ -272,6 +281,95 @@ void LoadSavedTargets()
                 savedTargets.Add(new SavedTarget { Name = name, GPS = gps });
         }
     }
+}
+
+
+// ── SETTINGS LOADER (NEW) ──────────────────────────────
+
+void LoadSavedSettings()
+{
+    bool inSection = false;
+    foreach (string rawLine in Me.CustomData.Split('\n'))
+    {
+        string line = rawLine.Trim();
+        if (line.Equals("[Settings]", StringComparison.OrdinalIgnoreCase))
+        { inSection = true; continue; }
+        if (line.StartsWith("[") && inSection) break; // next section
+        if (!inSection || string.IsNullOrEmpty(line) || line.StartsWith("//")) continue;
+
+        int eq = line.IndexOf('=');
+        if (eq > 0)
+        {
+            string key   = line.Substring(0, eq).Trim();
+            string value = line.Substring(eq + 1).Trim();
+
+            switch (key.ToLower())
+            {
+                case "defaulttype":
+                    defaultType = value;
+                    break;
+                case "defaultsalvo":
+                    if (int.TryParse(value, out int salvo) && salvo > 0)
+                        defaultSalvoSize = salvo;
+                    break;
+                case "parallellimit":
+                    if (int.TryParse(value, out int limit) && limit >= 1)
+                        dispatchParallelLimit = limit;
+                    break;
+            }
+        }
+    }
+}
+
+
+// ── SETTINGS SAVER (NEW) ───────────────────────────────
+
+void SaveSettings()
+{
+    // NEW: Persist settings to CustomData
+    string[] lines = Me.CustomData.Split('\n');
+    var sb = new System.Text.StringBuilder();
+    bool inSettingsSection = false;
+    bool settingsWritten = false;
+
+    foreach (string rawLine in lines)
+    {
+        string line = rawLine.Trim();
+
+        if (line.Equals("[Settings]", StringComparison.OrdinalIgnoreCase))
+        {
+            inSettingsSection = true;
+            sb.AppendLine("[Settings]");
+            sb.AppendLine($"DefaultType={defaultType}");
+            sb.AppendLine($"DefaultSalvo={defaultSalvoSize}");
+            sb.AppendLine($"ParallelLimit={dispatchParallelLimit}");
+            settingsWritten = true;
+            continue;
+        }
+
+        if (inSettingsSection && line.StartsWith("["))
+        {
+            inSettingsSection = false;
+        }
+
+        if (!inSettingsSection)
+        {
+            sb.AppendLine(rawLine);
+        }
+    }
+
+    // If [Settings] section didn't exist, append it
+    if (!settingsWritten)
+    {
+        sb.AppendLine();
+        sb.AppendLine("[Settings]");
+        sb.AppendLine($"DefaultType={defaultType}");
+        sb.AppendLine($"DefaultSalvo={defaultSalvoSize}");
+        sb.AppendLine($"ParallelLimit={dispatchParallelLimit}");
+    }
+
+    Me.CustomData = sb.ToString();
+    Echo("Settings saved to CustomData");
 }
 
 
@@ -370,12 +468,15 @@ void NavLeft()
             int ti = Array.IndexOf(ALL_TYPES, ParseTypeOrDefault(defaultType));
             ti = (ti - 1 + ALL_TYPES.Length) % ALL_TYPES.Length;
             defaultType = TYPE_CODE[ALL_TYPES[ti]];
+            SaveSettings();  // NEW: Save on change
             break;
         case 1: // Default Salvo — decrement
             if (defaultSalvoSize > 1) defaultSalvoSize--;
+            SaveSettings();  // NEW: Save on change
             break;
         case 2: // Parallel Limit — decrement
             if (dispatchParallelLimit > 1) dispatchParallelLimit--;
+            SaveSettings();  // NEW: Save on change
             break;
     }
 }
@@ -389,9 +490,10 @@ void NavRight()
             int ti = Array.IndexOf(ALL_TYPES, ParseTypeOrDefault(defaultType));
             ti = (ti + 1) % ALL_TYPES.Length;
             defaultType = TYPE_CODE[ALL_TYPES[ti]];
+            SaveSettings();  // NEW: Save on change
             break;
-        case 1: defaultSalvoSize++;         break;
-        case 2: dispatchParallelLimit++;    break;
+        case 1: defaultSalvoSize++;         SaveSettings();  break;  // NEW: Save on change
+        case 2: dispatchParallelLimit++;    SaveSettings();  break;  // NEW: Save on change
     }
 }
 
@@ -610,7 +712,7 @@ void DrawMenuLCD()
             sb.AppendLine($"{(settingsCursor == 1 ? "► " : "  ")}Default Salvo: [{defaultSalvoSize}]");
             sb.AppendLine($"{(settingsCursor == 2 ? "► " : "  ")}Parallel Limit:[{dispatchParallelLimit}]");
             sb.AppendLine("─────────────────────");
-            sb.AppendLine("  ✗ back (saves on exit)");
+            sb.AppendLine("  ◄► change (saves)  ✗ back");
             break;
 
         case Screen.ClearConfirm:
@@ -669,17 +771,17 @@ void ProcessArgument(string arg)
     {
         int s;
         if (int.TryParse(arg.Substring(6).Trim(), out s) && s > 0)
-        { defaultSalvoSize = s; Echo($"Default salvo: x{defaultSalvoSize}"); }
+        { defaultSalvoSize = s; SaveSettings(); Echo($"Default salvo: x{defaultSalvoSize}"); }
         return;
     }
     if (arg.StartsWith("type:", StringComparison.OrdinalIgnoreCase))
-    { defaultType = arg.Substring(5).Trim(); Echo($"Default type: [{defaultType}]"); return; }
+    { defaultType = arg.Substring(5).Trim(); SaveSettings(); Echo($"Default type: [{defaultType}]"); return; }
 
     if (arg.StartsWith("limit:", StringComparison.OrdinalIgnoreCase))
     {
         int n;
         if (int.TryParse(arg.Substring(6).Trim(), out n) && n >= 1)
-        { dispatchParallelLimit = n; Echo($"Parallel limit: {n}"); }
+        { dispatchParallelLimit = n; SaveSettings(); Echo($"Parallel limit: {n}"); }
         return;
     }
     if (arg.Equals("clear", StringComparison.OrdinalIgnoreCase))
@@ -689,6 +791,7 @@ void ProcessArgument(string arg)
         arg.Equals("refresh", StringComparison.OrdinalIgnoreCase))
     {
         LoadSavedTargets();
+        LoadSavedSettings();
         ScanForPackages();
         Echo($"Refreshed: {savedTargets.Count} targets, {packageNames.Count} packages.");
         return;
