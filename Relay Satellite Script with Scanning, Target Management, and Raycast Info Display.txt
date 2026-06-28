@@ -1,0 +1,311 @@
+
+/// Relay Satellite Script with Scanning, Target Management, and Raycast Info Display
+
+string satId;
+long hubAddress = 0;
+bool hubAddressReceived = false;
+IMyBroadcastListener hubAddressListener;
+string satChannelTag = "SAT_TO_HUB";
+string hubAddressChannel = "HUB_ADDRESS";
+string sharedSecret = "YourSecretKey123"; // Shared secret for authentication
+int messageId = 0;
+int updateInterval = 600; // Adjust based on UpdateFrequency
+int currentTick = 0;
+
+List<string> targetList = new List<string>();
+string lastScannedTarget = null;
+int displayCounter = 0;
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update10; // Updates every 10 ticks (~6 times per second)
+
+    hubAddressListener = IGC.RegisterBroadcastListener(hubAddressChannel);
+
+    satId = Me.CustomData;
+    if (string.IsNullOrEmpty(satId))
+    {
+        satId = Me.CubeGrid.EntityId.ToString(); // Fallback to grid ID
+        Me.CustomData = satId;
+    }
+
+    Log($"Initialized Relay Satellite with ID {satId}");
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    try
+    {
+        if (!string.IsNullOrEmpty(argument))
+        {
+            ProcessCommand(argument);
+        }
+
+        currentTick += 10;
+
+        // Check for Hub Address
+        if (!hubAddressReceived)
+        {
+            CheckForHubAddress();
+        }
+
+        if ((updateSource & UpdateType.Update10) != 0)
+        {
+            if (hubAddressReceived)
+            {
+                // Periodically send status updates to the Central Hub
+                if (currentTick >= updateInterval)
+                {
+                    SendStatusUpdate();
+                    currentTick = 0;
+                }
+            }
+            else
+            {
+                Log("Waiting for Central Hub address...");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Log($"Error in Main: {ex.Message}");
+    }
+}
+
+void ProcessCommand(string command)
+{
+    var args = command.Split(' ');
+    switch (args[0].ToLower())
+    {
+        case "scan":
+            double range = 22000; // Default range
+            if (args.Length > 1)
+            {
+                double.TryParse(args[1], out range);
+            }
+            PerformScan(range);
+            break;
+        case "add":
+            if (args.Length > 1 && args[1].ToLower() == "target")
+            {
+                AddTarget();
+            }
+            break;
+        case "send":
+            if (args.Length > 1 && args[1].ToLower() == "target" && args.Length > 2 && args[2].ToLower() == "info")
+            {
+                SendTargetInfo();
+            }
+            break;
+        default:
+            Log($"Unknown command: {command}");
+            break;
+    }
+}
+
+void PerformScan(double range)
+{
+    var camera = GridTerminalSystem.GetBlockWithName("SCANCAM") as IMyCameraBlock;
+    if (camera == null)
+    {
+        Log("SCANCAM not found.");
+        return;
+    }
+
+    if (!camera.EnableRaycast)
+    {
+        camera.EnableRaycast = true;
+    }
+
+    if (camera.CanScan(range))
+    {
+        MyDetectedEntityInfo entityInfo = camera.Raycast(range);
+
+        if (!entityInfo.IsEmpty())
+        {
+            lastScannedTarget = CreateGpsFromEntity(entityInfo);
+            DisplayScanResult(entityInfo);
+            DisplayRaycastInfo(entityInfo, range);
+            Log("Scan successful. Target data captured.");
+        }
+        else
+        {
+            Log("No entity detected within range.");
+        }
+    }
+    else
+    {
+        Log("SCANCAM is not ready to scan yet.");
+    }
+}
+
+string CreateGpsFromEntity(MyDetectedEntityInfo entity)
+{
+    return $"GPS:{entity.Name}:{entity.Position.X}:{entity.Position.Y}:{entity.Position.Z}:";
+}
+
+void DisplayScanResult(MyDetectedEntityInfo entity)
+{
+    var lcd = GridTerminalSystem.GetBlockWithName("SCANLCD") as IMyTextPanel;
+    if (lcd != null)
+    {
+        lcd.ContentType = ContentType.TEXT_AND_IMAGE;
+        string gpsData = CreateGpsFromEntity(entity);
+        lcd.WriteText($"Last Scan Result:\n{gpsData}");
+    }
+}
+
+void DisplayRaycastInfo(MyDetectedEntityInfo entity, double range)
+{
+    var lcd = GridTerminalSystem.GetBlockWithName("Raycast Info LCD") as IMyTextPanel;
+    if (lcd != null)
+    {
+        lcd.ContentType = ContentType.TEXT_AND_IMAGE;
+
+        // Variables for calculations
+        var camera = GridTerminalSystem.GetBlockWithName("SCANCAM") as IMyCameraBlock;
+        var remoteControl = GridTerminalSystem.GetBlockWithName("ScanRemote") as IMyRemoteControl;
+        if (remoteControl == null)
+        {
+            Log("ScanRemote not found. Cannot display raycast info.");
+            return;
+        }
+
+        bool gravityDetected = remoteControl.GetNaturalGravity().Length() > 0;
+        Vector3D planetCenter = new Vector3D();
+        if (gravityDetected)
+        {
+            remoteControl.TryGetPlanetPosition(out planetCenter);
+        }
+
+        // Calculation of position above ground
+        double heightAboveGround = 1000; // You can adjust this or make it configurable
+        Vector3D hitPosition = entity.HitPosition.HasValue ? entity.HitPosition.Value : entity.Position;
+        Vector3D directionToPlanetCenter = planetCenter - hitPosition;
+        Vector3D directionAwayFromPlanetCenter = -directionToPlanetCenter;
+        directionAwayFromPlanetCenter.Normalize();
+        Vector3D positionAboveGround = hitPosition + directionAwayFromPlanetCenter * heightAboveGround;
+
+        // Display information
+        displayCounter++;
+
+        lcd.WriteText($"Available Scan Range: {camera.AvailableScanRange} m");
+        if (camera.RaycastDistanceLimit == -1)
+            lcd.WriteText($"\nRaycast Distance Limit: Infinite", true);
+        else
+            lcd.WriteText($"\nRaycast Distance Limit: {camera.RaycastDistanceLimit} m", true);
+        lcd.WriteText($"\nTarget Name: {entity.Name}", true);
+        lcd.WriteText($"\nTarget Type: {entity.Type}", true);
+        lcd.WriteText($"\nTarget Center Position #{displayCounter}:\n  {entity.Position}", true);
+        lcd.WriteText($"\nHit Position #{displayCounter}:\n  {hitPosition}", true);
+        lcd.WriteText($"\nHit Pos Copy Ready:\n  GPS:HitPos #{displayCounter}:{hitPosition.X}:{hitPosition.Y}:{hitPosition.Z}:", true);
+        lcd.WriteText($"\nPosition Above Ground #{displayCounter}:\n  {positionAboveGround}", true);
+        lcd.WriteText($"\nPos Above Copy Ready:\n  GPS:Above#{displayCounter}:{positionAboveGround.X}:{positionAboveGround.Y}:{positionAboveGround.Z}:", true);
+
+        if (gravityDetected)
+        {
+            lcd.WriteText($"\nPlanet Center Copy Ready:\n  GPS:GravCenter#{displayCounter}:{planetCenter.X}:{planetCenter.Y}:{planetCenter.Z}:", true);
+        }
+
+        lcd.WriteText($"\nPosition Center of Mass Copy Ready:\n  GPS:Center of Mass#{displayCounter}:{entity.Position.X}:{entity.Position.Y}:{entity.Position.Z}:", true);
+        lcd.WriteText($"\n\nCalculation Number: {displayCounter}", true);
+
+        Echo($"\nCalculation Number: {displayCounter}");
+    }
+    else
+    {
+        Log("Raycast Info LCD not found.");
+    }
+}
+
+void AddTarget()
+{
+    if (lastScannedTarget != null)
+    {
+        targetList.Add(lastScannedTarget);
+        Log("Target added to the list.");
+    }
+    else
+    {
+        Log("No target data to add. Perform a scan first.");
+    }
+}
+
+void SendTargetInfo()
+{
+    if (!hubAddressReceived)
+    {
+        Log("Cannot send target info. Hub address not received yet.");
+        return;
+    }
+
+    if (targetList.Count == 0)
+    {
+        Log("No targets to send.");
+        return;
+    }
+
+    var messageContent = $"{satId}:Targets:{string.Join("|", targetList)}";
+    var securedMessage = $"{sharedSecret}:{messageContent}";
+
+    bool sent = IGC.SendUnicastMessage(hubAddress, satChannelTag, securedMessage);
+
+    if (sent)
+    {
+        Log("Target info sent to Central Hub.");
+        // Optionally clear the target list after sending
+        // targetList.Clear();
+    }
+    else
+    {
+        Log("Failed to send target info to Central Hub.");
+    }
+}
+
+void CheckForHubAddress()
+{
+    while (hubAddressListener.HasPendingMessage)
+    {
+        var igcMessage = hubAddressListener.AcceptMessage();
+        var addressString = igcMessage.Data.ToString();
+
+        long newHubAddress;
+        if (long.TryParse(addressString, out newHubAddress))
+        {
+            hubAddress = newHubAddress;
+            hubAddressReceived = true;
+            Log($"Received Hub Address: {hubAddress}");
+        }
+    }
+}
+
+void SendStatusUpdate()
+{
+    var messageContent = $"{satId}:Status Update {messageId}";
+    var securedMessage = $"{sharedSecret}:{messageContent}";
+
+    bool sent = IGC.SendUnicastMessage(hubAddress, satChannelTag, securedMessage);
+
+    if (sent)
+    {
+        Log($"Sent status update ID {messageId} to Central Hub");
+        messageId++;
+    }
+    else
+    {
+        Log("Failed to send status update to Central Hub. Hub may be out of range.");
+    }
+}
+
+void Log(string message)
+{
+    Echo(message);
+
+    // Optional: Write to a text panel named "SAT Log"
+    var lcd = GridTerminalSystem.GetBlockWithName("SAT Log") as IMyTextPanel;
+    if (lcd != null)
+    {
+        lcd.ContentType = ContentType.TEXT_AND_IMAGE;
+        lcd.WriteText($"{DateTime.Now}: {message}\n", true);
+    }
+}
