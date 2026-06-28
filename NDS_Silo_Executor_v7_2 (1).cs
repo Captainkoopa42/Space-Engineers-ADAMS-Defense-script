@@ -102,6 +102,7 @@ const string SHARED_DOOR_GROUP  = "Missile Doors";
 const string PRELAUNCH_TIMER    = "Missile PreLaunch";
 const string LAUNCH_PANEL_NAME  = "Missile Launch Panel";
 const string DEBUG_PANEL_NAME   = "Missile Debug Panel";
+const string STATUS_LCD_NAME    = "Silo Status LCD";  // NEW: For persistent startup status
 
 
 // ── TIMING (Update10 ticks, ~0.167s each) ─────────────
@@ -172,6 +173,7 @@ class MissileMount
 
 List<MissileMount> mounts = new List<MissileMount>();
 List<string> debugErrors = new List<string>();
+bool isReadyForOperation = false;  // NEW: Track if silo can safely launch
 
 
 // ── MISSION MODEL ─────────────────────────────────────
@@ -213,6 +215,7 @@ public Program()
         ndsId = Me.CubeGrid.EntityId.ToString();
 
     FindAllMountBlocks();
+    ValidateRequiredBlocks();  // NEW: Validate before allowing operation
     PrintStatus();
 }
 
@@ -224,7 +227,7 @@ public void Main(string argument, UpdateType updateSource)
 
     if ((updateSource & UpdateType.Update10) != 0)
     {
-        if (hubAddressReceived)
+        if (hubAddressReceived && isReadyForOperation)  // NEW: Only run if validated
         {
             SendStatusToHub();
             CheckForIncomingMessages();
@@ -234,6 +237,39 @@ public void Main(string argument, UpdateType updateSource)
         UpdateLaunchPanel();
         UpdateDebugPanel();
     }
+}
+
+
+// ── VALIDATION (NEW) ──────────────────────────────────
+
+bool ValidateRequiredBlocks()
+{
+    // NEW: Check for critical blocks on startup
+    var criticalErrors = new List<string>();
+    
+    var doorGroup = GridTerminalSystem.GetBlockGroupWithName(SHARED_DOOR_GROUP);
+    if (doorGroup == null)
+        criticalErrors.Add($"CRITICAL: Shared Door Group '{SHARED_DOOR_GROUP}' not found! Launches will hang.");
+    
+    var prelaunchTimer = GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER);
+    if (prelaunchTimer == null)
+        criticalErrors.Add($"CRITICAL: Prelaunch Timer '{PRELAUNCH_TIMER}' not found! Launches will stall.");
+    
+    if (criticalErrors.Count > 0)
+    {
+        isReadyForOperation = false;
+        debugErrors.Insert(0, "╔════ STARTUP VALIDATION FAILED ════╗");
+        foreach (var err in criticalErrors)
+            debugErrors.Insert(1, err);
+        debugErrors.Insert(2, "FIX: Create missing blocks or rename existing ones.");
+        debugErrors.Insert(3, "════════════════════════════════════");
+        Echo("SILO STARTUP FAILED - Check debug panel");
+        return false;
+    }
+    
+    isReadyForOperation = true;
+    debugErrors.Insert(0, "✓ All required blocks validated. Ready for operation.");
+    return true;
 }
 
 
@@ -370,6 +406,7 @@ void PrintStatus()
 {
     Echo($"NDS Silo {ndsId} — {mounts.Count} mounts, parallel limit {MAX_PARALLEL_STEP_TYPES}");
     Echo($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
+    Echo($"Ready for Operation: {(isReadyForOperation ? "YES" : "NO - FIX BLOCKS FIRST")}");
     foreach (var m in mounts)
         Echo($"  {m.Name}: PB={m.PBValid} Proj={m.Projectors.Count}/5 Welders={m.Welders.Count} State={m.State}");
 }
@@ -646,6 +683,14 @@ void SendStatusToHub()
     string payload = $"{sharedSecret}:{ndsId}:{messageId}:Status:{status}:{empty}:{building}:{ready}";
     IGC.SendUnicastMessage(hubAddress, hubChannelTag, payload);
     messageId++;
+    
+    // NEW: Write status to LCD for long-term memory
+    var statusLcd = GridTerminalSystem.GetBlockWithName(STATUS_LCD_NAME) as IMyTextPanel;
+    if (statusLcd != null)
+    {
+        statusLcd.ContentType = ContentType.TEXT_AND_IMAGE;
+        statusLcd.WriteText($"[{DateTime.Now:HH:mm:ss}] {status} | E:{empty} B:{building} R:{ready}\n", true);
+    }
 }
 
 void CheckForIncomingMessages()
@@ -809,11 +854,12 @@ void ProcessCommand(string arg)
     switch (l)
     {
         case "refresh":
-            FindAllMountBlocks(); PrintStatus(); break;
+            FindAllMountBlocks(); ValidateRequiredBlocks(); PrintStatus(); break;
         case "closedoors":
             CloseSharedDoors(); break;
         case "status":
             Echo($"Parallel limit: {MAX_PARALLEL_STEP_TYPES}");
+            Echo($"Ready for Operation: {(isReadyForOperation ? "YES" : "NO")}");
             Echo($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
             foreach (var m in mounts)
                 Echo($"{m.Name}: {m.State} Type={(m.LoadedType.HasValue ? TYPE_CODE[m.LoadedType.Value] : "none")} PB={m.PBValid}" +
@@ -851,6 +897,7 @@ void UpdateLaunchPanel()
     sb.AppendLine("=== NDS SILO ===");
     sb.AppendLine($"ID:     {ndsId}");
     sb.AppendLine($"Hub:    {(hubAddressReceived ? "LINKED" : "SEARCHING")}");
+    sb.AppendLine($"Ready:  {(isReadyForOperation ? "YES" : "NO - FIX BLOCKS")}");
     sb.AppendLine($"Silo:   {siloState}");
     sb.AppendLine($"Limit:  {MAX_PARALLEL_STEP_TYPES} parallel types");
     sb.AppendLine($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
