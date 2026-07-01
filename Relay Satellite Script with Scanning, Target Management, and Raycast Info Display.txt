@@ -1,11 +1,12 @@
 
 /// Relay Satellite Script with Scanning, Target Management, and Raycast Info Display
+/// v1.1 — Fixed channel mismatch, displayCounter reset, and hub address persistence
 
 string satId;
 long hubAddress = 0;
 bool hubAddressReceived = false;
 IMyBroadcastListener hubAddressListener;
-string satChannelTag = "SAT_TO_HUB";
+string satChannelTag = "NDS_TO_HUB";  // FIX 1: Changed from "SAT_TO_HUB" to match Hub listener
 string hubAddressChannel = "HUB_ADDRESS";
 string sharedSecret = "YourSecretKey123"; // Shared secret for authentication
 int messageId = 0;
@@ -15,6 +16,7 @@ int currentTick = 0;
 List<string> targetList = new List<string>();
 string lastScannedTarget = null;
 int displayCounter = 0;
+const int DISPLAY_COUNTER_WRAP = 1000;  // FIX 2: Reset displayCounter every N scans to prevent unbounded growth
 
 public Program()
 {
@@ -23,10 +25,25 @@ public Program()
     hubAddressListener = IGC.RegisterBroadcastListener(hubAddressChannel);
 
     satId = Me.CustomData;
-    if (string.IsNullOrEmpty(satId))
+    
+    // FIX 3: Load hub address from CustomData if previously saved
+    string[] lines = satId.Split('\n');
+    if (lines.Length > 0 && !string.IsNullOrEmpty(lines[0]))
+        satId = lines[0].Trim();
+    else
+        satId = Me.CubeGrid.EntityId.ToString();
+    
+    // Try to restore hub address from CustomData
+    if (lines.Length > 1 && long.TryParse(lines[1].Trim(), out long savedHubAddress))
     {
-        satId = Me.CubeGrid.EntityId.ToString(); // Fallback to grid ID
-        Me.CustomData = satId;
+        hubAddress = savedHubAddress;
+        hubAddressReceived = true;
+        Log($"Restored Hub Address from CustomData: {hubAddress}");
+    }
+    else
+    {
+        // First time or no saved address — save the current ID and empty address slot
+        SaveSatelliteState();
     }
 
     Log($"Initialized Relay Satellite with ID {satId}");
@@ -188,6 +205,10 @@ void DisplayRaycastInfo(MyDetectedEntityInfo entity, double range)
 
         // Display information
         displayCounter++;
+        
+        // FIX 2: Wrap displayCounter to prevent unbounded growth
+        if (displayCounter > DISPLAY_COUNTER_WRAP)
+            displayCounter = 1;
 
         lcd.WriteText($"Available Scan Range: {camera.AvailableScanRange} m");
         if (camera.RaycastDistanceLimit == -1)
@@ -245,7 +266,7 @@ void SendTargetInfo()
         return;
     }
 
-    var messageContent = $"{satId}:Targets:{string.Join("|", targetList)}";
+    var messageContent = $"{satId}:Target:{string.Join("|", targetList)}";
     var securedMessage = $"{sharedSecret}:{messageContent}";
 
     bool sent = IGC.SendUnicastMessage(hubAddress, satChannelTag, securedMessage);
@@ -275,13 +296,28 @@ void CheckForHubAddress()
             hubAddress = newHubAddress;
             hubAddressReceived = true;
             Log($"Received Hub Address: {hubAddress}");
+            
+            // FIX 3: Persist hub address to CustomData immediately
+            SaveSatelliteState();
         }
     }
 }
 
+// FIX 3: New function to persist satellite state to CustomData
+void SaveSatelliteState()
+{
+    // Format: Line 1 = satId, Line 2 = hubAddress (if received)
+    var sb = new System.Text.StringBuilder();
+    sb.AppendLine(satId);
+    if (hubAddressReceived)
+        sb.AppendLine(hubAddress.ToString());
+    
+    Me.CustomData = sb.ToString();
+}
+
 void SendStatusUpdate()
 {
-    var messageContent = $"{satId}:Status Update {messageId}";
+    var messageContent = $"{satId}:Status:{messageId}";
     var securedMessage = $"{sharedSecret}:{messageContent}";
 
     bool sent = IGC.SendUnicastMessage(hubAddress, satChannelTag, securedMessage);
