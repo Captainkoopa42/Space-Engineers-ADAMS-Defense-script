@@ -1,5 +1,5 @@
 // =====================================================
-// NDS CENTRAL HUB v9.1 - Command & Control + Nav UI + LCD Packages
+// NDS CENTRAL HUB v9.0 - Command & Control + Nav UI + LCD Packages
 // =====================================================
 //
 // NAVIGATION ARGUMENTS (wire to button panel or timer blocks):
@@ -18,7 +18,6 @@
 //   DefaultType=Nuke
 //   DefaultSalvo=2
 //   ParallelLimit=3
-//   AutoBroadcast=false
 //   (Settings are now auto-saved when changed via menu)
 //
 // STRIKE PACKAGES — two sources, merged automatically:
@@ -41,19 +40,12 @@
 // fired at a specific target, use the Strike Packages menu (or the
 // strike:NAME:GPS:... argument) instead of relying on the default.
 //
-// AUTO-BROADCAST MODE (NEW):
-//   toggle:autobroadcast   — toggle auto-broadcast ON/OFF
-//   Status bar shows [AUTO] or [MANUAL] mode
-//   When AUTO is ON: incoming target GPS auto-enqueues
-//   When AUTO is OFF (default): incoming targets are logged but NOT auto-queued
-//
 // DIRECT ARGUMENTS (bypass menu):
 //   GPS:Name:X:Y:Z:|3|Nuke
 //   GPS:Name:X:Y:Z:|DEC:2|NUKE:1
 //   strike:TEMPLATE_NAME:GPS:...
 //   salvo:3 | type:Nuke | limit:2 | clear | status | push:key:val
 //   reload | refresh   — rescan saved targets AND LCD packages
-//   toggle:autobroadcast — toggle auto-target-broadcast ON/OFF
 // =====================================================
 
 
@@ -140,7 +132,6 @@ List<string> packageNames = new List<string>();
 int    defaultSalvoSize      = 1;
 string defaultType           = "Normal";
 int    dispatchParallelLimit = 2;
-bool   autoBroadcastEnabled  = false;  // NEW: Toggle for auto-queuing satellite targets
 
 
 // ── IGC ───────────────────────────────────────────────
@@ -208,7 +199,7 @@ int    cursorRow       = 0;
 int    scrollOffset    = 0;
 string pendingTemplate = null;  // template selected, waiting for target
 
-// Settings cursor tracks which setting is selected (0-3)
+// Settings cursor tracks which setting is selected (0-2)
 int settingsCursor     = 0;
 
 // LCD display block names
@@ -239,7 +230,7 @@ public Program()
     LoadSavedSettings();  // NEW: Load settings from CustomData
     ScanForPackages();
     Echo($"Hub {hubId} online. {savedTargets.Count} saved targets, {packageNames.Count} strike packages.");
-    Echo($"Settings loaded: Type={defaultType}, Salvo={defaultSalvoSize}, Limit={dispatchParallelLimit}, AutoBroadcast={autoBroadcastEnabled}");
+    Echo($"Settings loaded: Type={defaultType}, Salvo={defaultSalvoSize}, Limit={dispatchParallelLimit}");
 }
 
 public void Main(string argument, UpdateType updateSource)
@@ -315,19 +306,25 @@ void LoadSavedSettings()
             switch (key.ToLower())
             {
                 case "defaulttype":
-                    defaultType = value;
+                    MissileType parsed;
+                    if (TryParseType(value, out parsed))
+                    {
+                        defaultType = TYPE_CODE[parsed];
+                    }
+                    else
+                    {
+                        Echo($"[Settings] Invalid DefaultType '{value}' — keeping previous value");
+                    }
                     break;
                 case "defaultsalvo":
-                    if (int.TryParse(value, out int salvo) && salvo > 0)
+                    int salvo;
+                    if (int.TryParse(value, out salvo) && salvo > 0)
                         defaultSalvoSize = salvo;
                     break;
                 case "parallellimit":
-                    if (int.TryParse(value, out int limit) && limit >= 1)
+                    int limit;
+                    if (int.TryParse(value, out limit) && limit >= 1)
                         dispatchParallelLimit = limit;
-                    break;
-                case "autobroadcast":  // NEW: Load auto-broadcast setting
-                    if (bool.TryParse(value, out bool autoBc))
-                        autoBroadcastEnabled = autoBc;
                     break;
             }
         }
@@ -356,7 +353,6 @@ void SaveSettings()
             sb.AppendLine($"DefaultType={defaultType}");
             sb.AppendLine($"DefaultSalvo={defaultSalvoSize}");
             sb.AppendLine($"ParallelLimit={dispatchParallelLimit}");
-            sb.AppendLine($"AutoBroadcast={autoBroadcastEnabled}");  // NEW: Save toggle state
             settingsWritten = true;
             continue;
         }
@@ -380,7 +376,6 @@ void SaveSettings()
         sb.AppendLine($"DefaultType={defaultType}");
         sb.AppendLine($"DefaultSalvo={defaultSalvoSize}");
         sb.AppendLine($"ParallelLimit={dispatchParallelLimit}");
-        sb.AppendLine($"AutoBroadcast={autoBroadcastEnabled}");  // NEW: Save toggle state
     }
 
     Me.CustomData = sb.ToString();
@@ -483,19 +478,15 @@ void NavLeft()
             int ti = Array.IndexOf(ALL_TYPES, ParseTypeOrDefault(defaultType));
             ti = (ti - 1 + ALL_TYPES.Length) % ALL_TYPES.Length;
             defaultType = TYPE_CODE[ALL_TYPES[ti]];
-            SaveSettings();
+            SaveSettings();  // NEW: Save on change
             break;
         case 1: // Default Salvo — decrement
             if (defaultSalvoSize > 1) defaultSalvoSize--;
-            SaveSettings();
+            SaveSettings();  // NEW: Save on change
             break;
         case 2: // Parallel Limit — decrement
             if (dispatchParallelLimit > 1) dispatchParallelLimit--;
-            SaveSettings();
-            break;
-        case 3: // NEW: Auto-Broadcast — toggle left (OFF)
-            autoBroadcastEnabled = false;
-            SaveSettings();
+            SaveSettings();  // NEW: Save on change
             break;
     }
 }
@@ -509,14 +500,10 @@ void NavRight()
             int ti = Array.IndexOf(ALL_TYPES, ParseTypeOrDefault(defaultType));
             ti = (ti + 1) % ALL_TYPES.Length;
             defaultType = TYPE_CODE[ALL_TYPES[ti]];
-            SaveSettings();
+            SaveSettings();  // NEW: Save on change
             break;
-        case 1: defaultSalvoSize++;         SaveSettings();  break;
-        case 2: dispatchParallelLimit++;    SaveSettings();  break;
-        case 3: // NEW: Auto-Broadcast — toggle right (ON)
-            autoBroadcastEnabled = true;
-            SaveSettings();
-            break;
+        case 1: defaultSalvoSize++;         SaveSettings();  break;  // NEW: Save on change
+        case 2: dispatchParallelLimit++;    SaveSettings();  break;  // NEW: Save on change
     }
 }
 
@@ -554,7 +541,7 @@ void NavEnter()
 
         case Screen.Settings:
             // Enter on settings cycles the cursor between settings rows
-            settingsCursor = (settingsCursor + 1) % 4;  // NEW: 4 settings now (was 3)
+            settingsCursor = (settingsCursor + 1) % 3;
             break;
 
         case Screen.ClearConfirm:
@@ -594,7 +581,7 @@ int GetCurrentListCount()
         case Screen.TargetSelect:   return Math.Max(1, savedTargets.Count);
         case Screen.QueueStatus:    return Math.Max(1, missionQueue.Count);
         case Screen.SiloStatus:     return Math.Max(1, activeNdsUnits.Values.Count(u => u.Confirmed));
-        case Screen.Settings:       return 4;  // NEW: 4 settings now (was 3)
+        case Screen.Settings:       return 3;
         case Screen.ClearConfirm:   return 1;
         default: return 1;
     }
@@ -631,7 +618,6 @@ void DrawMenuLCD()
         case Screen.Main:
             sb.AppendLine("╔═ NDS CENTRAL HUB ═╗");
             sb.AppendLine($"  Silos: {activeNdsUnits.Values.Count(u => u.Confirmed)}  Queue: {missionQueue.Count}");
-            sb.AppendLine($"  Mode:  [{(autoBroadcastEnabled ? "AUTO" : "MANUAL")}]");
             sb.AppendLine("─────────────────────");
             for (int i = 0; i < MAIN_MENU_ITEMS.Length; i++)
                 sb.AppendLine((i == cursorRow ? "► " : "  ") + MAIN_MENU_ITEMS[i]);
@@ -685,7 +671,7 @@ void DrawMenuLCD()
         case Screen.QueueStatus:
             sb.AppendLine("╔═ MISSION QUEUE ════╗");
             sb.AppendLine($"  {missionQueue.Count} mission(s) pending");
-            sb.AppendLine("────────────────���────");
+            sb.AppendLine("─────────────────────");
             if (missionQueue.Count == 0)
             {
                 sb.AppendLine("  Queue is empty.");
@@ -735,7 +721,6 @@ void DrawMenuLCD()
             sb.AppendLine($"{(settingsCursor == 0 ? "► " : "  ")}Default Type:  [{defaultType}]");
             sb.AppendLine($"{(settingsCursor == 1 ? "► " : "  ")}Default Salvo: [{defaultSalvoSize}]");
             sb.AppendLine($"{(settingsCursor == 2 ? "► " : "  ")}Parallel Limit:[{dispatchParallelLimit}]");
-            sb.AppendLine($"{(settingsCursor == 3 ? "► " : "  ")}Auto-Broadcast:[{(autoBroadcastEnabled ? "ON" : "OFF")}]");  // NEW: Toggle display
             sb.AppendLine("─────────────────────");
             sb.AppendLine("  ◄► change (saves)  ✗ back");
             break;
@@ -765,7 +750,6 @@ void DrawStatusLCD()
     sb.AppendLine("=== CENTRAL HUB ===");
     sb.AppendLine($"Default: [{defaultType}] x{defaultSalvoSize}");
     sb.AppendLine($"Limit:   {dispatchParallelLimit} parallel types");
-    sb.AppendLine($"Mode:    [{(autoBroadcastEnabled ? "AUTO" : "MANUAL")}]");  // NEW: Show toggle status
     sb.AppendLine($"Queue:   {missionQueue.Count} mission(s)");
     sb.AppendLine($"Silos:   {activeNdsUnits.Values.Count(u => u.Confirmed)}");
     sb.AppendLine($"Packages:{packageNames.Count}");
@@ -810,16 +794,6 @@ void ProcessArgument(string arg)
         { dispatchParallelLimit = n; SaveSettings(); Echo($"Parallel limit: {n}"); }
         return;
     }
-
-    // NEW: Auto-broadcast toggle
-    if (arg.Equals("toggle:autobroadcast", StringComparison.OrdinalIgnoreCase))
-    {
-        autoBroadcastEnabled = !autoBroadcastEnabled;
-        SaveSettings();
-        Echo($"Auto-broadcast: {(autoBroadcastEnabled ? "ON" : "OFF")}");
-        return;
-    }
-
     if (arg.Equals("clear", StringComparison.OrdinalIgnoreCase))
     { missionQueue.Clear(); Echo("Queue cleared."); return; }
 
@@ -837,7 +811,6 @@ void ProcessArgument(string arg)
     {
         Echo($"Queue: {missionQueue.Count}  Silos: {activeNdsUnits.Values.Count(u => u.Confirmed)}");
         Echo($"Targets loaded: {savedTargets.Count}  Packages: {packageNames.Count}");
-        Echo($"Auto-broadcast: {(autoBroadcastEnabled ? "ON" : "OFF")}");
         return;
     }
     if (arg.StartsWith("push:", StringComparison.OrdinalIgnoreCase))
@@ -986,22 +959,13 @@ void ProcessIncomingMessages()
                 unit.PendingAcks = Math.Max(0, unit.PendingAcks - 1);
                 break;
             case "Target":
-                // NEW: Only auto-enqueue if autoBroadcastEnabled is ON
                 // remainder is the untouched GPS payload, exactly as the
                 // satellite sent it — bare coordinates, nothing else. The
                 // satellite never attaches a type or count; that's the
                 // Hub's job via the shared default, or via a strike package
                 // the operator picks manually.
-                if (autoBroadcastEnabled)
-                {
-                    var satMission = ParseMissionArgument(remainder);
-                    if (satMission != null) EnqueueMission(satMission);
-                }
-                else
-                {
-                    // Log receipt without auto-queueing
-                    Echo($"[SAT] Target received (MANUAL mode): {ParseGPSName(remainder)} [NOT auto-queued]");
-                }
+                var satMission = ParseMissionArgument(remainder);
+                if (satMission != null) EnqueueMission(satMission);
                 break;
         }
     }
