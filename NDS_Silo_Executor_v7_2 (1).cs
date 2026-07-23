@@ -154,6 +154,9 @@ class MissileMount
     public FaultType   Fault = FaultType.None;
     public string      FaultReason = "";
     public int         LaunchReserved = 0;
+    public int         FaultReserved = 0;
+    public bool        MergeGroupConfigured = false;
+    public int         FunctionalMergeCount = 0;
     public string      ValidationStatus = "Not scanned";
 
     public IMyProgrammableBlock                   PB;
@@ -185,11 +188,11 @@ class MissileMount
     public bool Supports(MissileType type) { return IsUsable && Projectors.ContainsKey(type) && Projectors[type] != null && Projectors[type].IsFunctional; }
 
     // Whether this mount even uses the merge-verification convention at all.
-    public bool HasMergeConvention => MergeBlocks.Count > 0;
+    public bool HasMergeConvention { get { return MergeGroupConfigured; } }
 
     // True only if at least one configured merge block is actually connected —
     // hardware-level proof a built missile is physically attached.
-    public bool MergeConfirmsPresent => MergeBlocks.Count > 0 && MergeBlocks.Any(m => m.IsConnected);
+    public bool MergeConfirmsPresent { get { return MergeGroupConfigured && FunctionalMergeCount > 0 && MergeBlocks.Any(m => m.IsConnected); } }
 }
 
 List<MissileMount> mounts = new List<MissileMount>();
@@ -243,7 +246,7 @@ public Program()
         ndsId = Me.CubeGrid.EntityId.ToString();
 
     FindAllMountBlocks();
-    LoadMountStorage();
+    LoadMountStorage(true);
     ValidateRequiredBlocks();  // validates shared infrastructure plus at least one usable mount
     PrintStatus();
 }
@@ -259,7 +262,8 @@ public void Main(string argument, UpdateType updateSource)
         if (hubAddressReceived)
         {
             SendStatusToHub();
-            if (isReadyForOperation) CheckForIncomingMessages();
+            isReadyForOperation = CanAcceptMissionsNow();
+            if (CanAcceptMissionsNow()) CheckForIncomingMessages();
         }
         RunMountStates();
         RunSiloLogic();
@@ -289,7 +293,7 @@ bool ValidateRequiredBlocks()
 
     int usable = mounts.Count(m => m.IsHardwareCapable);
     int serviceable = mounts.Count(m => IsServiceableMount(m));
-    isReadyForOperation = sharedInfrastructureValid && serviceable > 0;
+    isReadyForOperation = CanAcceptMissionsNow();
 
     if (!sharedInfrastructureValid)
     {
@@ -362,7 +366,13 @@ void FindAllMountBlocks()
         if (dg != null) dg.GetBlocksOfType(mount.Doors, d => d.IsFunctional);
 
         var mg = GridTerminalSystem.GetBlockGroupWithName(name + MERGE_GROUP_SUF);
-        if (mg != null) mg.GetBlocksOfType(mount.MergeBlocks, m => m.IsFunctional);
+        mount.MergeGroupConfigured = mg != null;
+        if (mg != null)
+        {
+            mg.GetBlocksOfType(mount.MergeBlocks, m => m.IsFunctional);
+            mount.FunctionalMergeCount = mount.MergeBlocks.Count;
+            if (mount.FunctionalMergeCount == 0) reasons.Add("merge group configured but no functional merge blocks");
+        }
 
         foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
         SetWelders(mount, false);
@@ -381,7 +391,7 @@ void FindAllMountBlocks()
         mounts.Add(mount);
         debugErrors.Add("[" + name + "] " + mount.ValidationStatus);
         debugErrors.Add("  Supports: " + SupportedTypesText(mount));
-        debugErrors.Add("  Merge verification: " + (mount.HasMergeConvention ? (mount.MergeConfirmsPresent ? "CONNECTED" : "configured/disconnected") : "not configured"));
+        debugErrors.Add("  Merge verification: " + (mount.MergeGroupConfigured ? (mount.FunctionalMergeCount > 0 ? (mount.MergeConfirmsPresent ? "CONNECTED" : "functional/disconnected") : "CONFIGURED BUT NO FUNCTIONAL MERGE") : "not configured"));
         debugErrors.Add(" ");
     }
 }
@@ -393,6 +403,11 @@ void PrintStatus()
     Echo("Serviceable Mounts: " + mounts.Count(m => IsServiceableMount(m)) + "/" + mounts.Count);
     foreach (var m in mounts)
         Echo("  " + m.Name + ": " + m.State + " " + m.ValidationStatus + " Supports=" + SupportedTypesText(m));
+}
+
+bool CanAcceptMissionsNow()
+{
+    return sharedInfrastructureValid && mounts.Any(m => IsServiceableMount(m));
 }
 
 bool IsServiceableMount(MissileMount mount)
@@ -418,6 +433,7 @@ class MountSnapshot
     public FaultType Fault;
     public string FaultReason;
     public int LaunchReserved;
+    public int FaultReserved;
     public MissionStep LaunchStep;
     public int StateTick;
 }
@@ -437,6 +453,7 @@ Dictionary<string, MountSnapshot> CaptureMountSnapshots()
             Fault = m.Fault,
             FaultReason = m.FaultReason,
             LaunchReserved = m.LaunchReserved,
+            FaultReserved = m.FaultReserved,
             LaunchStep = m.LaunchStep,
             StateTick = m.StateTick
         };
@@ -450,7 +467,7 @@ void RefreshMountsSafely()
     var snapshots = CaptureMountSnapshots();
     FindAllMountBlocks();
     Storage = storageBefore;
-    LoadMountStorage();
+    LoadMountStorage(false);
     ReconcileMountSnapshots(snapshots);
     ValidateRequiredBlocks();
     PrintStatus();
@@ -463,42 +480,59 @@ void ReconcileMountSnapshots(Dictionary<string, MountSnapshot> snapshots)
         MountSnapshot old;
         if (!snapshots.TryGetValue(mount.Name, out old)) continue;
         if (mount.State == MountState.Unavailable) continue;
+
         bool oldOccupied = old.State == MountState.Building || old.State == MountState.LaunchReady || old.State == MountState.Launching || old.State == MountState.PostLaunch || old.State == MountState.FaultedLoaded;
-        bool newOccupied = mount.State == MountState.Building || mount.State == MountState.LaunchReady || mount.State == MountState.Launching || mount.State == MountState.PostLaunch || mount.State == MountState.FaultedLoaded;
-        if (!newOccupied && oldOccupied)
+        if (!oldOccupied) continue;
+
+        mount.State = old.State;
+        mount.LoadedType = old.LoadedType;
+        mount.BuildOrdered = old.BuildOrdered;
+        mount.ManualBuild = old.ManualBuild;
+        mount.Fault = old.Fault;
+        mount.FaultReason = old.FaultReason;
+        mount.LaunchReserved = old.LaunchReserved;
+        mount.FaultReserved = old.FaultReserved;
+        mount.LaunchStep = old.LaunchStep;
+        mount.StateTick = old.StateTick;
+
+        if (mount.MergeGroupConfigured && mount.FunctionalMergeCount == 0)
         {
-            if (mount.HasMergeConvention && !mount.MergeConfirmsPresent && (old.State == MountState.LaunchReady || old.State == MountState.FaultedLoaded || old.State == MountState.Launching || old.State == MountState.PostLaunch))
-            {
-                mount.State = MountState.Empty;
-                mount.LoadedType = null;
-                mount.BuildOrdered = false;
-                mount.ManualBuild = false;
-                mount.Fault = FaultType.None;
-                mount.FaultReason = "Refresh reconciled occupied state to Empty because merge verification is disconnected.";
-                mount.LaunchReserved = 0;
-                mount.LaunchStep = null;
-            }
-            else
-            {
-                mount.State = old.State;
-                mount.LoadedType = old.LoadedType;
-                mount.BuildOrdered = old.BuildOrdered;
-                mount.ManualBuild = old.ManualBuild;
-                mount.Fault = old.Fault;
-                mount.FaultReason = old.FaultReason;
-                mount.LaunchReserved = old.LaunchReserved;
-                mount.LaunchStep = old.LaunchStep;
-                mount.StateTick = old.StateTick;
-                if (mount.State == MountState.Launching && mount.LaunchStep == null)
-                    EnterFault(mount, FaultType.ReloadRecoveryFault, "Refresh/reload found Launching state without mission reservation; operator recovery required.", true);
-            }
+            EnterFault(mount, FaultType.UnknownLoadedFault, "Merge group is configured but no functional merge blocks are available; cannot verify physical state.", true);
+            continue;
+        }
+
+        if (old.State == MountState.Building)
+        {
+            if (!BuildProjectorHasProjection(mount))
+                EnterFault(mount, FaultType.BuildFault, "Refresh found Building state but selected projector has no valid active projection.", false);
+        }
+        else if (old.State == MountState.LaunchReady)
+        {
+            if (mount.MergeGroupConfigured && !mount.MergeConfirmsPresent)
+                EnterFault(mount, FaultType.UnknownLoadedFault, "LaunchReady missile lost merge physical-presence confirmation during refresh.", false);
+        }
+        else if (old.State == MountState.Launching)
+        {
+            if (mount.MergeGroupConfigured && mount.FunctionalMergeCount > 0 && !mount.MergeConfirmsPresent)
+                ConfirmSeparation(mount);
+            else if (mount.LaunchStep == null)
+                EnterFault(mount, FaultType.ReloadRecoveryFault, "Runtime refresh found Launching without a live MissionStep reservation.", true);
+        }
+        else if (old.State == MountState.PostLaunch)
+        {
+            // Runtime refresh keeps the live StateTick so the remaining hold delay is preserved.
+        }
+        else if (old.State == MountState.FaultedLoaded)
+        {
+            // Faulted loaded states require explicit operator recovery even if merge later disconnects.
         }
     }
 }
 
+
 // ── PERSISTED MOUNT STATE ───────────────────────────
 
-void LoadMountStorage()
+void LoadMountStorage(bool coldStartup)
 {
     var lines = string.IsNullOrWhiteSpace(Storage)
         ? new string[0]
@@ -519,8 +553,10 @@ void LoadMountStorage()
         string reason = parts.Length > 7 ? parts[7].Replace("~", "|") : "";
         int reserved = 0;
         if (parts.Length > 8) int.TryParse(parts[8], out reserved);
+        int faultReserved = 0;
+        if (parts.Length > 9) int.TryParse(parts[9], out faultReserved);
         int savedTick = tickCounter;
-        if (parts.Length > 9) int.TryParse(parts[9], out savedTick);
+        if (parts.Length > 10) int.TryParse(parts[10], out savedTick);
         if (!Enum.TryParse(parts[2], out st)) continue;
 
         if ((st == MountState.Building || st == MountState.LaunchReady || st == MountState.Launching || st == MountState.PostLaunch || st == MountState.FaultedLoaded) && hasType)
@@ -532,21 +568,20 @@ void LoadMountStorage()
             mount.Fault = ft;
             mount.FaultReason = reason;
             mount.LaunchReserved = reserved;
+            mount.FaultReserved = faultReserved;
             mount.StateTick = savedTick;
 
-            if (mount.HasMergeConvention && (st == MountState.LaunchReady || st == MountState.FaultedLoaded) && !mount.MergeConfirmsPresent)
+            if (mount.MergeGroupConfigured && mount.FunctionalMergeCount == 0)
             {
-                mount.State = MountState.Empty;
-                mount.LoadedType = null;
-                mount.BuildOrdered = false;
-                mount.ManualBuild = false;
-                mount.Fault = FaultType.None;
-                mount.FaultReason = "Storage occupied state cleared because merge verification is disconnected.";
-                mount.LaunchReserved = 0;
+                EnterFault(mount, FaultType.UnknownLoadedFault, "Merge group is configured but no functional merge blocks are available; cannot verify restored physical state.", true);
             }
-            else if ((st == MountState.Launching || st == MountState.PostLaunch) && reserved > 0)
+            else if (mount.HasMergeConvention && st == MountState.LaunchReady && !mount.MergeConfirmsPresent)
             {
-                EnterFault(mount, FaultType.ReloadRecoveryFault, "Reload found an in-flight launch without recoverable mission step; operator must inspect and reset.", true);
+                EnterFault(mount, FaultType.UnknownLoadedFault, "Stored LaunchReady missile lacks merge physical-presence confirmation after reload.", false);
+            }
+            else if (coldStartup && (st == MountState.Launching || st == MountState.PostLaunch) && reserved > 0)
+            {
+                EnterFault(mount, FaultType.ReloadRecoveryFault, "Cold reload found an in-flight/timed launch without recoverable mission step; operator must inspect and resolve.", true);
             }
             else if (!mount.HasMergeConvention && st == MountState.LaunchReady)
             {
@@ -575,6 +610,7 @@ void SaveMountStorage()
           .Append(m.Fault).Append("|")
           .Append((m.FaultReason == null ? "" : m.FaultReason).Replace("|", "~").Replace("\n", " ")).Append("|")
           .Append(m.LaunchReserved).Append("|")
+          .Append(m.FaultReserved).Append("|")
           .Append(m.StateTick).Append("\n");
     }
     Storage = sb.ToString();
@@ -603,6 +639,26 @@ void RunMountStates()
     SaveMountStorage();
 }
 
+bool BuildProjectorHasProjection(MissileMount mount)
+{
+    var proj = mount.ActiveProjector;
+    return proj != null && proj.IsFunctional && proj.IsProjecting && proj.TotalBlocks > 0;
+}
+
+void ConfirmSeparation(MissileMount mount)
+{
+    mount.State = MountState.PostLaunch;
+    mount.StateTick = tickCounter;
+    if (mount.LaunchStep != null && mount.LaunchReserved > 0)
+    {
+        mount.LaunchStep.InFlight = Math.Max(0, mount.LaunchStep.InFlight - mount.LaunchReserved);
+        mount.LaunchStep.Fired += mount.LaunchReserved;
+    }
+    mount.LaunchReserved = 0;
+    mount.Fault = FaultType.None;
+    Echo(mount.Name + " separation confirmed; holding doors open.");
+}
+
 void RunBuildState(MissileMount mount)
 {
     if (tickCounter % TICKS_BUILD_CHECK != 0) return;
@@ -614,7 +670,7 @@ void RunBuildState(MissileMount mount)
     proj.Enabled = true;
     SetWelders(mount, true);
 
-    if (!proj.IsProjecting || proj.TotalBlocks <= 0)
+    if (!BuildProjectorHasProjection(mount))
     {
         EnterFault(mount, FaultType.BuildFault, "BUILD FAULT — selected " + TYPE_CODE[mount.LoadedType.Value] + " projector has no valid blueprint/projection", false);
         return;
@@ -637,18 +693,15 @@ void RunBuildState(MissileMount mount)
 
 void RunLaunchingState(MissileMount mount)
 {
-    bool separated = mount.HasMergeConvention ? !mount.MergeConfirmsPresent : (tickCounter - mount.StateTick >= TICKS_POST_LAUNCH);
+    if (mount.MergeGroupConfigured && mount.FunctionalMergeCount == 0)
+    {
+        EnterFault(mount, FaultType.SeparationFault, "SEPARATION FAULT - merge group has no functional merge blocks; shared doors held open", true);
+        return;
+    }
+    bool separated = mount.MergeGroupConfigured ? !mount.MergeConfirmsPresent : (tickCounter - mount.StateTick >= TICKS_POST_LAUNCH);
     if (separated)
     {
-        mount.State = MountState.PostLaunch;
-        mount.StateTick = tickCounter;
-        if (mount.LaunchStep != null)
-        {
-            mount.LaunchStep.InFlight = Math.Max(0, mount.LaunchStep.InFlight - mount.LaunchReserved);
-            mount.LaunchStep.Fired += mount.LaunchReserved;
-        }
-        mount.LaunchReserved = 0;
-        Echo(mount.Name + " separation confirmed; holding doors open.");
+        ConfirmSeparation(mount);
         return;
     }
     if (tickCounter - mount.StateTick > TICKS_SEPARATION_TIMEOUT)
@@ -656,6 +709,7 @@ void RunLaunchingState(MissileMount mount)
         EnterFault(mount, FaultType.SeparationFault, "SEPARATION FAULT - missile may obstruct doors; shared doors held open", true);
     }
 }
+
 
 void RunPostLaunchState(MissileMount mount)
 {
@@ -669,8 +723,10 @@ void RunPostLaunchState(MissileMount mount)
     mount.ManualBuild = false;
     mount.Fault = FaultType.None;
     mount.LaunchReserved = 0;
+    mount.FaultReserved = 0;
     mount.LaunchStep = null;
     mount.FaultReason = "";
+    mount.FaultReserved = 0;
 }
 
 void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoorsOpen)
@@ -682,9 +738,9 @@ void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoo
     foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
     if (mount.LaunchReserved > 0 && mount.LaunchStep != null)
     {
-        if (fault == FaultType.SeparationFault || fault == FaultType.ReloadRecoveryFault)
-            mount.LaunchStep.FaultReserved += mount.LaunchReserved;
+        mount.LaunchStep.FaultReserved += mount.LaunchReserved;
         mount.LaunchStep.InFlight = Math.Max(0, mount.LaunchStep.InFlight - mount.LaunchReserved);
+        mount.FaultReserved += mount.LaunchReserved;
         mount.LaunchReserved = 0;
     }
     if (holdDoorsOpen)
@@ -700,6 +756,14 @@ void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoo
 void FaultMount(MissileMount mount, string reason)
 {
     EnterFault(mount, FaultType.UnknownLoadedFault, reason, false);
+}
+
+void ReleaseFaultReservation(MissileMount mount, bool countAsFired)
+{
+    if (mount.LaunchStep == null || mount.FaultReserved <= 0) return;
+    int n = mount.FaultReserved;
+    mount.LaunchStep.FaultReserved = Math.Max(0, mount.LaunchStep.FaultReserved - n);
+    if (countAsFired) mount.LaunchStep.Fired += n;
 }
 
 void ReScanPB(MissileMount mount)
@@ -728,6 +792,23 @@ List<MissionStep> GetActiveSteps(TargetMission mission)
 
 // ── SILO LOGIC ────────────────────────────────────────
 
+bool SharedDoorsClosed()
+{
+    var grp = GridTerminalSystem.GetBlockGroupWithName(SHARED_DOOR_GROUP);
+    if (grp == null) return false;
+    var doors = new List<IMyDoor>();
+    grp.GetBlocksOfType(doors, d => d.IsFunctional);
+    if (doors.Count == 0) return false;
+    foreach (var d in doors)
+        if (d.Status != DoorStatus.Closed) return false;
+    return true;
+}
+
+bool SiloIdleWithDoorsClosed()
+{
+    return siloState == SiloState.Idle && SharedDoorsClosed();
+}
+
 bool HasLaunchReadyForDemand()
 {
     if (missionQueue.Count == 0) return false;
@@ -742,7 +823,7 @@ bool HasLaunchReadyForDemand()
 
 void RunSiloLogic()
 {
-    if (siloState == SiloState.Idle) AssignBuilds();
+    if (SiloIdleWithDoorsClosed()) AssignBuilds();
     UpdateMissionBlocks();
 
     bool launching = mounts.Any(m => m.State == MountState.Launching || m.State == MountState.PostLaunch);
@@ -802,7 +883,7 @@ void RunSiloLogic()
             else if (tickCounter - siloStateTick >= TICKS_POST_SEPARATION_HOLD)
             {
                 CloseSharedDoors();
-                siloState = SiloState.Idle;
+                if (SharedDoorsClosed()) siloState = SiloState.Idle;
             }
             break;
     }
@@ -936,6 +1017,8 @@ void AttemptFires()
         }
         else
         {
+            mount.LaunchStep = step;
+            mount.LaunchReserved = 1;
             EnterFault(mount, FaultType.LaunchCommandFault, "TryRun failed; missile still present", false);
             step.Status = "Faulted";
             step.BlockReason = mount.Name + ": LAUNCH COMMAND FAULT - TryRun failed; missile still present";
@@ -1006,7 +1089,7 @@ void SendStatusToHub()
     int empty    = mounts.Count(m => m.State == MountState.Empty && m.IsUsable);
     int building = mounts.Count(m => m.State == MountState.Building);
     int ready    = mounts.Count(m => m.State == MountState.LaunchReady);
-    string status = (sharedInfrastructureValid && mounts.Any(m => IsServiceableMount(m))) ? "Ready" : "Busy";
+    string status = CanAcceptMissionsNow() ? "Ready" : "Busy";
     string payload = $"{sharedSecret}:{ndsId}:{messageId}:Status:{status}:{empty}:{building}:{ready}";
     IGC.SendUnicastMessage(hubAddress, hubChannelTag, payload);
     messageId++;
@@ -1141,6 +1224,8 @@ void ProcessCommand(string arg)
         MissileType type;
         if (!TryParseType(typeStr, out type)) { Echo($"buildall: unknown type '{typeStr}'"); return; }
 
+        if (!SiloIdleWithDoorsClosed()) { Echo("Manual build rejected: silo doors are not closed and idle."); return; }
+
         int started = 0;
         foreach (var mount in mounts)
         {
@@ -1168,6 +1253,8 @@ void ProcessCommand(string arg)
         MissileType type;
         if (!TryParseType(typeStr, out type)) { Echo($"build: unknown type '{typeStr}'"); return; }
 
+        if (!SiloIdleWithDoorsClosed())
+        { Echo("Manual build rejected: silo doors are not closed and idle."); return; }
         if (!mount.CanAcceptBuild)
         { Echo($"build: {mount.Name} is not Empty (currently {mount.State}) — cannot start a manual build."); return; }
         if (!mount.Supports(type))
@@ -1179,12 +1266,60 @@ void ProcessCommand(string arg)
     }
 
 
+
+    if (l.StartsWith("resolvemount:"))
+    {
+        string rest = arg.Substring(13).Trim();
+        int sep = rest.LastIndexOf(':');
+        if (sep < 0) { Echo("Usage: resolvemount:<mount name>:notlaunched|departed|unknown"); return; }
+        string mountName = rest.Substring(0, sep).Trim();
+        string outcome = rest.Substring(sep + 1).Trim().ToLower();
+        var mount = mounts.FirstOrDefault(m => m.Name.Equals(mountName, StringComparison.OrdinalIgnoreCase));
+        if (mount == null) { Echo("resolvemount: unknown mount '" + mountName + "'"); return; }
+        if (mount.State != MountState.FaultedLoaded) { Echo("resolvemount: " + mount.Name + " is not FaultedLoaded."); return; }
+        if (outcome == "unknown")
+        {
+            Echo("resolvemount: " + mount.Name + " kept faulted; mission reservation remains blocked.");
+            return;
+        }
+        if (outcome != "notlaunched" && outcome != "departed")
+        { Echo("Usage: resolvemount:<mount name>:notlaunched|departed|unknown"); return; }
+
+        ReleaseFaultReservation(mount, outcome == "departed");
+        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+        SetWelders(mount, false);
+        if (outcome == "departed")
+        {
+            mount.State = MountState.PostLaunch;
+            mount.StateTick = tickCounter;
+            mount.Fault = FaultType.None;
+            mount.FaultReason = "Operator confirmed departed after accounting fault; post-launch hold active.";
+            Echo("resolvemount: " + mount.Name + " confirmed departed; Fired incremented and post-launch hold started.");
+        }
+        else
+        {
+            mount.State = MountState.Empty;
+            mount.LoadedType = null;
+            mount.BuildOrdered = false;
+            mount.ManualBuild = false;
+            mount.Fault = FaultType.None;
+            mount.FaultReason = "Operator confirmed not launched and bay physically cleared/repaired.";
+            Echo("resolvemount: " + mount.Name + " confirmed not launched; reservation released and mount set Empty.");
+        }
+        mount.FaultReserved = 0;
+        mount.LaunchReserved = 0;
+        mount.LaunchStep = null;
+        SaveMountStorage();
+        return;
+    }
+
     if (l.StartsWith("resetmount:"))
     {
         string mountName = arg.Substring(11).Trim();
         var mount = mounts.FirstOrDefault(m => m.Name.Equals(mountName, StringComparison.OrdinalIgnoreCase));
         if (mount == null) { Echo("resetmount: unknown mount '" + mountName + "'"); return; }
         if (mount.State == MountState.Unavailable) { Echo("resetmount: " + mount.Name + " is unavailable; run refresh after repairs."); return; }
+        if (mount.FaultReserved > 0) { Echo("resetmount: " + mount.Name + " has a reserved mission shot; use resolvemount:<mount>:notlaunched|departed|unknown."); return; }
         foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
         SetWelders(mount, false);
         mount.State = MountState.Empty;
@@ -1246,9 +1381,9 @@ void UpdateLaunchPanel()
     sb.AppendLine("=== NDS SILO ===");
     sb.AppendLine($"ID:     {ndsId}");
     sb.AppendLine($"Hub:    {(hubAddressReceived ? "LINKED" : "SEARCHING")}");
-    sb.AppendLine($"Operational: {(isReadyForOperation ? "YES" : "NO")}");
+    sb.AppendLine($"Operational: {(CanAcceptMissionsNow() ? "YES" : "NO")}");
     sb.AppendLine($"Shared: {sharedInfrastructureStatus}");
-    sb.AppendLine($"Usable Mounts: {mounts.Count(m => m.IsUsable)}/{mounts.Count}");
+    sb.AppendLine($"Serviceable Mounts: {mounts.Count(m => IsServiceableMount(m))}/{mounts.Count}");
     sb.AppendLine($"Silo:   {siloState}");
     sb.AppendLine($"Limit:  {MAX_PARALLEL_STEP_TYPES} parallel types");
     sb.AppendLine($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
@@ -1260,9 +1395,10 @@ void UpdateLaunchPanel()
         string typeStr  = m.LoadedType.HasValue ? $"[{TYPE_CODE[m.LoadedType.Value]}]" : "[empty]";
         int    rem      = (m.ActiveProjector != null) ? m.ActiveProjector.RemainingBlocks : 0;
         string remStr   = m.State == MountState.Building ? $" {rem}blk" : "";
-        string mergeStr = m.HasMergeConvention ? (m.MergeConfirmsPresent ? " [merge:CONNECTED]" : " [merge:DISCONNECTED]") : " [merge:not configured]";
+        string mergeStr = !m.MergeGroupConfigured ? " [merge:not configured]" : (m.FunctionalMergeCount == 0 ? " [merge:CONFIGURED/NO FUNCTIONAL]" : (m.MergeConfirmsPresent ? " [merge:CONNECTED]" : " [merge:DISCONNECTED]"));
         sb.AppendLine($"{m.Name}: {m.State.ToString().ToUpper()} {typeStr}{remStr}{mergeStr}");
         sb.AppendLine($"  Supports: {SupportedTypesText(m)}");
+        sb.AppendLine($"  Fault: {m.Fault} Reserved:{m.FaultReserved}");
         if (!string.IsNullOrEmpty(m.FaultReason)) sb.AppendLine($"  Fault/Note: {m.FaultReason}");
     }
 
