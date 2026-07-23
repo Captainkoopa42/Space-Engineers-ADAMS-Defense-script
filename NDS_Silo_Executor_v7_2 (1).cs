@@ -235,7 +235,7 @@ List<TargetMission> missionQueue = new List<TargetMission>();
 
 
 // ── SILO DOOR STATE ───────────────────────────────────
-enum SiloState { Idle, OpeningDoors, PreLaunch, Active, ClosingDoors }
+enum SiloState { Idle, OpeningDoors, PreLaunch, Active, ClosingDoors, DoorFault }
 SiloState siloState     = SiloState.Idle;
 int       siloStateTick = 0;
 
@@ -463,6 +463,7 @@ class MountSnapshot
     public int LaunchReserved;
     public int FaultReserved;
     public int OrphanedFaultReserved;
+    public int MergeWaitStartTick;
     public MissionStep LaunchStep;
     public int StateTick;
 }
@@ -484,6 +485,7 @@ Dictionary<string, MountSnapshot> CaptureMountSnapshots()
             LaunchReserved = m.LaunchReserved,
             FaultReserved = m.FaultReserved,
             OrphanedFaultReserved = m.OrphanedFaultReserved,
+            MergeWaitStartTick = m.MergeWaitStartTick,
             LaunchStep = m.LaunchStep,
             StateTick = m.StateTick
         };
@@ -500,6 +502,16 @@ void RefreshMountsSafely()
     LoadMountStorage(false);
     ReconcileMountSnapshots(snapshots);
     ValidateRequiredBlocks();
+    if (launchSafetyFault)
+    {
+        string clearReason;
+        if (CanClearDoorFault(out clearReason))
+        {
+            launchSafetyFault = false;
+            launchSafetyFaultReason = "";
+            siloState = AllConstructionDoorsClosed() ? SiloState.Idle : siloState;
+        }
+    }
     PrintStatus();
 }
 
@@ -522,6 +534,7 @@ void ReconcileMountSnapshots(Dictionary<string, MountSnapshot> snapshots)
         mount.LaunchReserved = old.LaunchReserved;
         mount.FaultReserved = old.FaultReserved;
         mount.OrphanedFaultReserved = old.OrphanedFaultReserved;
+        mount.MergeWaitStartTick = old.MergeWaitStartTick;
         mount.LaunchStep = old.LaunchStep;
         mount.StateTick = old.StateTick;
 
@@ -604,11 +617,11 @@ void LoadMountStorage(bool coldStartup)
         if (parts.Length > 11) int.TryParse(parts[11], out savedTick);
         if (!Enum.TryParse(parts[2], out st)) continue;
 
-        if ((st == MountState.Building || st == MountState.LaunchReady || st == MountState.Launching || st == MountState.PostLaunch || st == MountState.FaultedLoaded) && hasType)
+        if (st == MountState.Building || st == MountState.LaunchReady || st == MountState.Launching || st == MountState.PostLaunch || MountState.FaultedLoaded == st)
         {
             bool hardwareUnavailableOnLoad = mount.State == MountState.Unavailable;
             mount.State = st;
-            mount.LoadedType = mt;
+            mount.LoadedType = hasType ? (MissileType?)mt : null;
             mount.BuildOrdered = ordered;
             mount.ManualBuild = manual;
             mount.Fault = ft;
@@ -617,6 +630,10 @@ void LoadMountStorage(bool coldStartup)
             mount.FaultReserved = faultReserved;
             mount.OrphanedFaultReserved = orphaned;
             mount.StateTick = coldStartup ? tickCounter : savedTick;
+            if (!hasType && st != MountState.FaultedLoaded)
+            {
+                EnterFault(mount, coldStartup ? FaultType.ReloadRecoveryFault : FaultType.UnknownLoadedFault, "Stored occupied state had no known missile type; physical inspection required.", true);
+            }
 
             if (coldStartup && faultReserved > 0)
             {
@@ -823,9 +840,11 @@ void ConvertLaunchReservationToFault(MissileMount mount)
 
 void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoorsOpen)
 {
+    bool sameFault = mount.State == MountState.FaultedLoaded && mount.Fault == fault && mount.FaultReason == reason;
     mount.State = MountState.FaultedLoaded;
     mount.Fault = fault;
     mount.FaultReason = reason;
+    mount.MergeWaitStartTick = -1;
     SetWelders(mount, false);
     foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
     ConvertLaunchReservationToFault(mount);
@@ -834,9 +853,12 @@ void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoo
         OpenSharedDoors();
         foreach (var door in mount.Doors) door.OpenDoor();
     }
-    string prefix = fault == FaultType.SeparationFault ? "SEPARATION FAULT" : (fault == FaultType.LaunchCommandFault ? "LAUNCH COMMAND FAULT" : (fault == FaultType.BuildFault ? "BUILD FAULT" : "LOAD FAULT"));
-    debugErrors.Insert(0, "[" + mount.Name + "] " + prefix + ": " + reason);
-    Echo(mount.Name + ": " + prefix + " - " + reason);
+    string prefix = fault == FaultType.SeparationFault ? "SEPARATION FAULT" : (fault == FaultType.LaunchCommandFault ? "LAUNCH COMMAND FAULT" : (fault == FaultType.BuildFault ? "BUILD FAULT" : (fault == FaultType.DoorFault ? "DOOR FAULT" : "LOAD FAULT")));
+    if (!sameFault)
+    {
+        debugErrors.Insert(0, "[" + mount.Name + "] " + prefix + ": " + reason);
+        Echo(mount.Name + ": " + prefix + " - " + reason);
+    }
 }
 
 void FaultMount(MissileMount mount, string reason)
@@ -894,8 +916,11 @@ bool MountDoorsHardwareOk(MissileMount mount)
 
 void EnterDoorFault(string reason)
 {
+    if (launchSafetyFault && launchSafetyFaultReason == reason && siloState == SiloState.DoorFault) return;
     launchSafetyFault = true;
     launchSafetyFaultReason = reason;
+    siloState = SiloState.DoorFault;
+    siloStateTick = tickCounter;
     debugErrors.Insert(0, "[DOOR FAULT] " + reason);
     Echo("DOOR FAULT: " + reason);
 }
@@ -961,6 +986,18 @@ void OpenDoorsForLaunchDemand()
 bool SiloIdleWithDoorsClosed()
 {
     return siloState == SiloState.Idle && AllConstructionDoorsClosed();
+}
+
+bool CanClearDoorFault(out string reason)
+{
+    reason = "";
+    if (!SharedDoorsHardwareOk()) { reason = "shared door group missing or damaged"; return false; }
+    foreach (var m in mounts)
+        if (!MountDoorsHardwareOk(m)) { reason = m.Name + " mount door damaged/nonfunctional"; return false; }
+    if (RequiresDoorsHeldOpen()) { reason = "unresolved launch safety fault requires doors held open"; return false; }
+    if (AllConstructionDoorsClosed() || RequiredLaunchDoorsOpen()) return true;
+    reason = "doors are neither all safely closed nor open for an existing launch";
+    return false;
 }
 
 bool RequiresDoorsHeldOpen()
@@ -1030,13 +1067,14 @@ void RunSiloLogic()
             { EnterDoorFault("Required shared or mount launch doors failed to open before timeout."); break; }
             if (RequiredLaunchDoorsOpen() && tickCounter - siloStateTick >= TICKS_DOOR_OPEN)
             {
-                TriggerPreLaunchTimer();
+                if (!PrelaunchTimerReady() || !TriggerPreLaunchTimer()) { EnterDoorFault("Prelaunch timer missing or damaged before launch."); break; }
                 siloState = SiloState.PreLaunch;
                 siloStateTick = tickCounter;
             }
             break;
 
         case SiloState.PreLaunch:
+            if (!PrelaunchTimerReady()) { EnterDoorFault("Prelaunch timer damaged during prelaunch delay."); break; }
             if (tickCounter - siloStateTick >= TICKS_PRELAUNCH)
             {
                 siloState = SiloState.Active;
@@ -1051,6 +1089,9 @@ void RunSiloLogic()
                 siloState = SiloState.ClosingDoors;
                 siloStateTick = tickCounter;
             }
+            break;
+
+        case SiloState.DoorFault:
             break;
 
         case SiloState.ClosingDoors:
@@ -1255,10 +1296,18 @@ void ApplyToDoorGroup(string groupName, Action<IMyDoor> action)
     grp.GetBlocksOfType(doors);
     foreach (var d in doors) action(d);
 }
-void TriggerPreLaunchTimer()
+bool PrelaunchTimerReady()
 {
     var t = GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER) as IMyTimerBlock;
-    if (t != null) t.Trigger();
+    return t != null && t.IsFunctional;
+}
+
+bool TriggerPreLaunchTimer()
+{
+    var t = GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER) as IMyTimerBlock;
+    if (t == null || !t.IsFunctional) return false;
+    t.Trigger();
+    return true;
 }
 
 
@@ -1541,8 +1590,27 @@ void ProcessCommand(string arg)
         mount.OrphanedFaultReserved = 0;
         mount.LaunchStep = null;
         mount.FaultReason = "Reset by operator. WARNING: operator must verify bay is physically clear before rebuilding; resetmount does not prove safe clearance.";
+        if (!AllConstructionDoorsClosed())
+        {
+            CloseSharedDoors();
+            siloState = SiloState.ClosingDoors;
+            siloStateTick = tickCounter;
+        }
+        else siloState = SiloState.Idle;
         SaveMountStorage();
         Echo("resetmount: " + mount.Name + " set to Empty. Verify physical bay is clear.");
+        return;
+    }
+
+    if (l == "cleardoorfault")
+    {
+        string reason;
+        if (!CanClearDoorFault(out reason)) { Echo("cleardoorfault rejected: " + reason); return; }
+        launchSafetyFault = false;
+        launchSafetyFaultReason = "";
+        siloState = AllConstructionDoorsClosed() ? SiloState.Idle : SiloState.OpeningDoors;
+        siloStateTick = tickCounter;
+        Echo("Door fault cleared after live validation.");
         return;
     }
 
@@ -1599,6 +1667,7 @@ void UpdateLaunchPanel()
     sb.AppendLine($"Shared: {sharedInfrastructureStatus}");
     sb.AppendLine($"Serviceable Mounts: {mounts.Count(m => IsServiceableMount(m))}/{mounts.Count}");
     sb.AppendLine($"Silo:   {siloState}");
+    if (launchSafetyFault) sb.AppendLine($"DoorFault: {launchSafetyFaultReason}");
     sb.AppendLine($"Limit:  {MAX_PARALLEL_STEP_TYPES} parallel types");
     sb.AppendLine($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
     sb.AppendLine($"Queue:  {missionQueue.Count} mission(s)");
@@ -1645,6 +1714,7 @@ void UpdateDebugPanel()
     lcd.ContentType = ContentType.TEXT_AND_IMAGE;
     var sb = new System.Text.StringBuilder();
     sb.AppendLine("=== SILO DIAGNOSTICS ===");
+    if (launchSafetyFault) sb.AppendLine("DOOR FAULT: " + launchSafetyFaultReason);
 
     if (debugErrors.Count == 0)
     {
