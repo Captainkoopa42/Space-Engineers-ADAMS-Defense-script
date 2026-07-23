@@ -511,6 +511,7 @@ void RefreshMountsSafely()
     LoadMountStorage(false);
     selectedLaunchMounts.Clear();
     ReconcileMountSnapshots(snapshots);
+    NormalizeMountOutputsAfterRefresh();
     ValidateRequiredBlocks();
     if (launchSafetyFault)
     {
@@ -523,6 +524,27 @@ void RefreshMountsSafely()
         }
     }
     PrintStatus();
+}
+
+void NormalizeMountOutputsAfterRefresh()
+{
+    foreach (var mount in mounts)
+    {
+        foreach (var kv in mount.Projectors)
+            if (mount.State != MountState.Building || !mount.LoadedType.HasValue || kv.Key != mount.LoadedType.Value)
+                kv.Value.Enabled = false;
+
+        if (mount.State == MountState.Building && mount.ActiveProjector != null && AllConstructionDoorsClosed() && !LaunchPathOwnsDoors())
+        {
+            mount.ActiveProjector.Enabled = true;
+            SetWelders(mount, true);
+        }
+        else
+        {
+            if (mount.ActiveProjector != null && mount.State == MountState.Building) mount.ActiveProjector.Enabled = false;
+            SetWelders(mount, false);
+        }
+    }
 }
 
 void ReconcileMountSnapshots(Dictionary<string, MountSnapshot> snapshots)
@@ -778,6 +800,11 @@ void RunBuildState(MissileMount mount)
     {
         proj.Enabled = false;
         SetWelders(mount, false);
+        if (LaunchPathOwnsDoors())
+        {
+            mount.BuildDoorWaitStartTick = -1;
+            return;
+        }
         if (mount.BuildDoorWaitStartTick < 0) mount.BuildDoorWaitStartTick = tickCounter;
         CloseSharedDoors();
         if (tickCounter - mount.BuildDoorWaitStartTick >= TICKS_DOOR_CLOSE_TIMEOUT)
@@ -993,6 +1020,18 @@ bool AllConstructionDoorsClosed()
     return true;
 }
 
+bool IsEligibleLaunchCandidate(MissileMount mount, MissileType type)
+{
+    if (mount == null || mount.State != MountState.LaunchReady) return false;
+    if (!mount.LoadedType.HasValue || mount.LoadedType.Value != type) return false;
+    if (!mount.PBValid) return false;
+    IMyProjector proj;
+    if (!mount.Projectors.TryGetValue(type, out proj) || proj == null || !proj.IsFunctional) return false;
+    if (!MountDoorsHardwareOk(mount)) return false;
+    if (mount.MergeGroupConfigured && (GetFunctionalMergeCount(mount) == 0 || !MergeConnectedLive(mount))) return false;
+    return true;
+}
+
 void SelectLaunchCandidates()
 {
     selectedLaunchMounts.Clear();
@@ -1006,7 +1045,7 @@ void SelectLaunchCandidates()
         {
             if (need <= 0) break;
             var m = mounts.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-            if (m == null || m.State != MountState.LaunchReady || !m.LoadedType.HasValue || m.LoadedType.Value != step.Type) continue;
+            if (!IsEligibleLaunchCandidate(m, step.Type)) continue;
             if (selectedLaunchMounts.Contains(m.Name)) continue;
             selectedLaunchMounts.Add(m.Name);
             need--;
@@ -1042,6 +1081,37 @@ void OpenDoorsForLaunchDemand()
 }
 
 
+bool LaunchPathOwnsDoors()
+{
+    return siloState == SiloState.OpeningDoors || siloState == SiloState.PreLaunch || siloState == SiloState.Active ||
+        mounts.Any(m => m.State == MountState.Launching || m.State == MountState.PostLaunch) || RequiresDoorsHeldOpen();
+}
+
+bool LaunchSelectionStillValid()
+{
+    if (selectedLaunchMounts.Count == 0) return false;
+    if (missionQueue.Count == 0) return false;
+    var active = GetActiveSteps(missionQueue[0]);
+    foreach (string name in selectedLaunchMounts.ToList())
+    {
+        var m = mounts.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (m == null || !m.LoadedType.HasValue) return false;
+        var step = active.FirstOrDefault(st => st.Type == m.LoadedType.Value && st.RemainingDemand > 0);
+        if (step == null || !IsEligibleLaunchCandidate(m, step.Type)) return false;
+    }
+    return true;
+}
+
+bool BeginLaunchDoorSequence()
+{
+    SelectLaunchCandidates();
+    if (selectedLaunchMounts.Count == 0) return false;
+    OpenDoorsForLaunchDemand();
+    siloState = SiloState.OpeningDoors;
+    siloStateTick = tickCounter;
+    return true;
+}
+
 bool SiloIdleWithDoorsClosed()
 {
     return siloState == SiloState.Idle && AllConstructionDoorsClosed();
@@ -1061,10 +1131,11 @@ void ResumeAfterDoorFault()
     }
     else if (HasLaunchReadyForDemand())
     {
-        SelectLaunchCandidates();
-        OpenDoorsForLaunchDemand();
-        siloState = SiloState.OpeningDoors;
-        siloStateTick = tickCounter;
+        if (!BeginLaunchDoorSequence())
+        {
+            launchSafetyFault = true;
+            siloState = SiloState.DoorFault;
+        }
     }
     else if (AnyConstructionDoorOpenOrMoving())
     {
@@ -1143,9 +1214,12 @@ void RunSiloLogic()
         case SiloState.Idle:
             if (readyForMission || launching)
             {
-                OpenDoorsForLaunchDemand();
-                siloState = SiloState.OpeningDoors;
-                siloStateTick = tickCounter;
+                if (!BeginLaunchDoorSequence())
+                {
+                    CloseSharedDoors();
+                    siloState = SiloState.ClosingDoors;
+                    siloStateTick = tickCounter;
+                }
             }
             else if (postLaunch)
             {
@@ -1159,6 +1233,12 @@ void RunSiloLogic()
             if (!SharedDoorsHardwareOk()) { EnterDoorFault("Shared launch doors missing or damaged while opening."); break; }
             if (tickCounter - siloStateTick >= TICKS_DOOR_OPEN_TIMEOUT && !RequiredLaunchDoorsOpen())
             { EnterDoorFault("Required shared or mount launch doors failed to open before timeout."); break; }
+            if (!LaunchSelectionStillValid())
+            {
+                SelectLaunchCandidates();
+                if (selectedLaunchMounts.Count == 0) { CloseSharedDoors(); siloState = SiloState.ClosingDoors; siloStateTick = tickCounter; break; }
+                OpenDoorsForLaunchDemand();
+            }
             if (RequiredLaunchDoorsOpen() && tickCounter - siloStateTick >= TICKS_DOOR_OPEN)
             {
                 if (!PrelaunchTimerReady() || !TriggerPreLaunchTimer()) { EnterDoorFault("Prelaunch timer missing or damaged before launch."); break; }
@@ -1191,9 +1271,11 @@ void RunSiloLogic()
         case SiloState.ClosingDoors:
             if (readyForMission || launching)
             {
-                OpenSharedDoors();
-                siloState = SiloState.OpeningDoors;
-                siloStateTick = tickCounter;
+                if (!BeginLaunchDoorSequence())
+                {
+                    CloseSharedDoors();
+                    siloStateTick = tickCounter;
+                }
             }
             else if (separationFault)
             {
@@ -1307,6 +1389,7 @@ void AttemptFires()
         if (mission.Complete)
         {
             missionQueue.RemoveAt(0);
+            selectedLaunchMounts.Clear();
             Echo("Mission complete: " + ParseGPSName(mission.GPS));
         }
         return;
@@ -1674,11 +1757,8 @@ void ProcessCommand(string arg)
         if (mount == null) { Echo("resetmount: unknown mount '" + mountName + "'"); return; }
         if (mount.State == MountState.Unavailable) { Echo("resetmount: " + mount.Name + " is unavailable; run refresh after repairs."); return; }
         if (mount.LaunchReserved > 0 || mount.FaultReserved > 0 || mount.OrphanedFaultReserved > 0) { Echo("resetmount: " + mount.Name + " has a reserved mission shot; use resolvemount:<mount>:notlaunched|departed|unknown."); return; }
-        if (safeStartupShutdown)
-        {
-            foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
-            SetWelders(mount, false);
-        }
+        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+        SetWelders(mount, false);
         mount.State = MountState.Empty;
         mount.LoadedType = null;
         mount.BuildOrdered = false;
@@ -1735,7 +1815,15 @@ void ProcessCommand(string arg)
             }
             break;
         case "clearqueue":
-            missionQueue.Clear(); Echo("Mission queue cleared."); break;
+            missionQueue.Clear();
+            selectedLaunchMounts.Clear();
+            if (!mounts.Any(m => m.State == MountState.Launching || m.State == MountState.PostLaunch) && !RequiresDoorsHeldOpen() && !AllConstructionDoorsClosed())
+            {
+                CloseSharedDoors();
+                siloState = SiloState.ClosingDoors;
+                siloStateTick = tickCounter;
+            }
+            Echo("Mission queue cleared."); break;
     }
 }
 
