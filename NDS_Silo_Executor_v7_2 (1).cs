@@ -160,6 +160,7 @@ class MissileMount
     public int         FaultReserved = 0;
     public int         OrphanedFaultReserved = 0;
     public int         MergeWaitStartTick = -1;
+    public int         BuildDoorWaitStartTick = -1;
     public bool        MergeGroupConfigured = false;
     public int         FunctionalMergeCount = 0;
     public string      ValidationStatus = "Not scanned";
@@ -207,6 +208,7 @@ bool sharedInfrastructureValid = false;
 string sharedInfrastructureStatus = "Not validated";
 bool launchSafetyFault = false;
 string launchSafetyFaultReason = "";
+HashSet<string> selectedLaunchMounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 
 // ── MISSION MODEL ─────────────────────────────────────
@@ -252,7 +254,7 @@ public Program()
     if (string.IsNullOrEmpty(ndsId) || ndsId.Contains("="))
         ndsId = Me.CubeGrid.EntityId.ToString();
 
-    FindAllMountBlocks();
+    FindAllMountBlocks(true);
     LoadMountStorage(true);
     ValidateRequiredBlocks();  // validates shared infrastructure plus at least one usable mount
     PrintStatus();
@@ -272,7 +274,9 @@ public void Main(string argument, UpdateType updateSource)
             isReadyForOperation = CanAcceptMissionsNow();
             if (CanAcceptMissionsNow()) CheckForIncomingMessages();
         }
+        isReadyForOperation = CanAcceptMissionsNow();
         RunMountStates();
+        isReadyForOperation = CanAcceptMissionsNow();
         RunSiloLogic();
         UpdateLaunchPanel();
         UpdateDebugPanel();
@@ -330,7 +334,7 @@ bool ValidateRequiredBlocks()
 
 // ── BLOCK DISCOVERY & DIAGNOSTICS ──────────────────────
 
-void FindAllMountBlocks()
+void FindAllMountBlocks(bool safeStartupShutdown)
 {
     mounts.Clear();
     debugErrors.Clear();
@@ -386,8 +390,11 @@ void FindAllMountBlocks()
             if (GetFunctionalMergeCount(mount) == 0) reasons.Add("merge group configured but no functional merge blocks");
         }
 
-        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
-        SetWelders(mount, false);
+        if (safeStartupShutdown)
+        {
+            foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+            SetWelders(mount, false);
+        }
 
         if (reasons.Count > 0)
         {
@@ -435,7 +442,7 @@ bool MergeConnectedLive(MissileMount mount)
 
 bool CanAcceptMissionsNow()
 {
-    return sharedInfrastructureValid && !launchSafetyFault && SharedDoorsHardwareOk() && mounts.Any(m => IsServiceableMount(m));
+    return sharedInfrastructureValid && !launchSafetyFault && SharedDoorsHardwareOk() && PrelaunchTimerReady() && mounts.Any(m => IsServiceableMount(m));
 }
 
 bool IsServiceableMount(MissileMount mount)
@@ -464,6 +471,7 @@ class MountSnapshot
     public int FaultReserved;
     public int OrphanedFaultReserved;
     public int MergeWaitStartTick;
+    public int BuildDoorWaitStartTick;
     public MissionStep LaunchStep;
     public int StateTick;
 }
@@ -486,6 +494,7 @@ Dictionary<string, MountSnapshot> CaptureMountSnapshots()
             FaultReserved = m.FaultReserved,
             OrphanedFaultReserved = m.OrphanedFaultReserved,
             MergeWaitStartTick = m.MergeWaitStartTick,
+            BuildDoorWaitStartTick = m.BuildDoorWaitStartTick,
             LaunchStep = m.LaunchStep,
             StateTick = m.StateTick
         };
@@ -497,9 +506,10 @@ void RefreshMountsSafely()
 {
     string storageBefore = Storage;
     var snapshots = CaptureMountSnapshots();
-    FindAllMountBlocks();
+    FindAllMountBlocks(false);
     Storage = storageBefore;
     LoadMountStorage(false);
+    selectedLaunchMounts.Clear();
     ReconcileMountSnapshots(snapshots);
     ValidateRequiredBlocks();
     if (launchSafetyFault)
@@ -509,7 +519,7 @@ void RefreshMountsSafely()
         {
             launchSafetyFault = false;
             launchSafetyFaultReason = "";
-            siloState = AllConstructionDoorsClosed() ? SiloState.Idle : siloState;
+            ResumeAfterDoorFault();
         }
     }
     PrintStatus();
@@ -535,6 +545,7 @@ void ReconcileMountSnapshots(Dictionary<string, MountSnapshot> snapshots)
         mount.FaultReserved = old.FaultReserved;
         mount.OrphanedFaultReserved = old.OrphanedFaultReserved;
         mount.MergeWaitStartTick = old.MergeWaitStartTick;
+        mount.BuildDoorWaitStartTick = old.BuildDoorWaitStartTick;
         mount.LaunchStep = old.LaunchStep;
         mount.StateTick = old.StateTick;
 
@@ -561,6 +572,12 @@ void ReconcileMountSnapshots(Dictionary<string, MountSnapshot> snapshots)
         {
             if (!BuildProjectorHasProjection(mount))
                 EnterFault(mount, FaultType.BuildFault, "Refresh found Building state but selected projector has no valid active projection.", false);
+            else
+            {
+                var proj = mount.ActiveProjector;
+                if (proj != null) proj.Enabled = true;
+                SetWelders(mount, true);
+            }
         }
         else if (old.State == MountState.LaunchReady)
         {
@@ -750,6 +767,25 @@ void RunBuildState(MissileMount mount)
     var proj = mount.ActiveProjector;
     if (proj == null || !proj.IsFunctional) { EnterFault(mount, FaultType.BuildFault, "Build projector missing or nonfunctional", false); return; }
 
+    if (!SharedDoorsHardwareOk() || !MountDoorsHardwareOk(mount))
+    {
+        proj.Enabled = false;
+        SetWelders(mount, false);
+        EnterDoorFault("Construction door hardware damaged while building " + mount.Name);
+        return;
+    }
+    if (!AllConstructionDoorsClosed())
+    {
+        proj.Enabled = false;
+        SetWelders(mount, false);
+        if (mount.BuildDoorWaitStartTick < 0) mount.BuildDoorWaitStartTick = tickCounter;
+        CloseSharedDoors();
+        if (tickCounter - mount.BuildDoorWaitStartTick >= TICKS_DOOR_CLOSE_TIMEOUT)
+            EnterDoorFault("Construction doors failed to close while building " + mount.Name);
+        return;
+    }
+    mount.BuildDoorWaitStartTick = -1;
+
     proj.Enabled = true;
     SetWelders(mount, true);
 
@@ -845,6 +881,7 @@ void EnterFault(MissileMount mount, FaultType fault, string reason, bool holdDoo
     mount.Fault = fault;
     mount.FaultReason = reason;
     mount.MergeWaitStartTick = -1;
+    mount.BuildDoorWaitStartTick = -1;
     SetWelders(mount, false);
     foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
     ConvertLaunchReservationToFault(mount);
@@ -956,15 +993,38 @@ bool AllConstructionDoorsClosed()
     return true;
 }
 
+void SelectLaunchCandidates()
+{
+    selectedLaunchMounts.Clear();
+    if (missionQueue.Count == 0) return;
+    var active = GetActiveSteps(missionQueue[0]);
+    foreach (var step in active)
+    {
+        int need = step.RemainingDemand;
+        if (need <= 0) continue;
+        foreach (var name in MISSILE_MANIFEST)
+        {
+            if (need <= 0) break;
+            var m = mounts.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (m == null || m.State != MountState.LaunchReady || !m.LoadedType.HasValue || m.LoadedType.Value != step.Type) continue;
+            if (selectedLaunchMounts.Contains(m.Name)) continue;
+            selectedLaunchMounts.Add(m.Name);
+            need--;
+        }
+    }
+}
+
+bool IsSelectedLaunchCandidate(MissileMount mount)
+{
+    return selectedLaunchMounts.Contains(mount.Name);
+}
+
 bool RequiredLaunchDoorsOpen()
 {
     if (!SharedDoorsInState(DoorStatus.Open)) return false;
-    if (missionQueue.Count == 0) return true;
-    var active = GetActiveSteps(missionQueue[0]);
     foreach (var m in mounts)
     {
-        if (m.State != MountState.LaunchReady || !m.LoadedType.HasValue) continue;
-        if (!active.Any(s => s.Type == m.LoadedType.Value && s.RemainingDemand > 0)) continue;
+        if (!IsSelectedLaunchCandidate(m)) continue;
         if (m.Doors.Count > 0 && !DoorListInState(m.Doors, DoorStatus.Open)) return false;
     }
     return true;
@@ -972,26 +1032,60 @@ bool RequiredLaunchDoorsOpen()
 
 void OpenDoorsForLaunchDemand()
 {
+    SelectLaunchCandidates();
     OpenSharedDoors();
-    if (missionQueue.Count == 0) return;
-    var active = GetActiveSteps(missionQueue[0]);
     foreach (var m in mounts)
     {
-        if (m.State != MountState.LaunchReady || !m.LoadedType.HasValue) continue;
-        if (!active.Any(s => s.Type == m.LoadedType.Value && s.RemainingDemand > 0)) continue;
+        if (!IsSelectedLaunchCandidate(m)) continue;
         foreach (var door in m.Doors) if (door.IsFunctional) door.OpenDoor();
     }
 }
+
 
 bool SiloIdleWithDoorsClosed()
 {
     return siloState == SiloState.Idle && AllConstructionDoorsClosed();
 }
 
+bool AnyConstructionDoorOpenOrMoving()
+{
+    if (!AllConstructionDoorsClosed()) return true;
+    return false;
+}
+
+void ResumeAfterDoorFault()
+{
+    if (AllConstructionDoorsClosed())
+    {
+        siloState = SiloState.Idle;
+    }
+    else if (HasLaunchReadyForDemand())
+    {
+        SelectLaunchCandidates();
+        OpenDoorsForLaunchDemand();
+        siloState = SiloState.OpeningDoors;
+        siloStateTick = tickCounter;
+    }
+    else if (AnyConstructionDoorOpenOrMoving())
+    {
+        CloseSharedDoors();
+        siloState = SiloState.ClosingDoors;
+        siloStateTick = tickCounter;
+    }
+    else
+    {
+        launchSafetyFault = true;
+        if (string.IsNullOrEmpty(launchSafetyFaultReason)) launchSafetyFaultReason = "No safe resume path after door fault.";
+        siloState = SiloState.DoorFault;
+    }
+    isReadyForOperation = CanAcceptMissionsNow();
+}
+
 bool CanClearDoorFault(out string reason)
 {
     reason = "";
     if (!SharedDoorsHardwareOk()) { reason = "shared door group missing or damaged"; return false; }
+    if (!PrelaunchTimerReady()) { reason = "prelaunch timer missing or damaged"; return false; }
     foreach (var m in mounts)
         if (!MountDoorsHardwareOk(m)) { reason = m.Name + " mount door damaged/nonfunctional"; return false; }
     if (RequiresDoorsHeldOpen()) { reason = "unresolved launch safety fault requires doors held open"; return false; }
@@ -1114,7 +1208,7 @@ void RunSiloLogic()
             else if (tickCounter - siloStateTick >= TICKS_POST_SEPARATION_HOLD)
             {
                 CloseSharedDoors();
-                if (AllConstructionDoorsClosed()) siloState = SiloState.Idle;
+                if (AllConstructionDoorsClosed()) { selectedLaunchMounts.Clear(); siloState = SiloState.Idle; }
             }
             break;
     }
@@ -1122,7 +1216,7 @@ void RunSiloLogic()
 
 void AssignBuilds()
 {
-    if (!isReadyForOperation || missionQueue.Count == 0) return;
+    if (!CanAcceptMissionsNow() || missionQueue.Count == 0) return;
     var mission = missionQueue[0];
     var active = GetActiveSteps(mission);
     if (active.Count == 0) return;
@@ -1197,6 +1291,7 @@ void StartBuild(MissileMount mount, MissileType type, bool manual)
     mount.LaunchStep = null;
     mount.FaultReason = "";
     mount.MergeWaitStartTick = -1;
+    mount.BuildDoorWaitStartTick = -1;
     SetWelders(mount, true);
     SaveMountStorage();
     Echo(mount.Name + " building [" + TYPE_CODE[type] + "]" + (manual ? " (manual)" : ""));
@@ -1219,7 +1314,7 @@ void AttemptFires()
 
     foreach (var mount in mounts)
     {
-        if (mount.State != MountState.LaunchReady || !mount.LoadedType.HasValue) continue;
+        if (mount.State != MountState.LaunchReady || !mount.LoadedType.HasValue || !IsSelectedLaunchCandidate(mount)) continue;
         var step = active.FirstOrDefault(s => s.Type == mount.LoadedType.Value && !s.Complete && s.RemainingDemand > 0);
         if (step == null) continue;
 
@@ -1579,8 +1674,11 @@ void ProcessCommand(string arg)
         if (mount == null) { Echo("resetmount: unknown mount '" + mountName + "'"); return; }
         if (mount.State == MountState.Unavailable) { Echo("resetmount: " + mount.Name + " is unavailable; run refresh after repairs."); return; }
         if (mount.LaunchReserved > 0 || mount.FaultReserved > 0 || mount.OrphanedFaultReserved > 0) { Echo("resetmount: " + mount.Name + " has a reserved mission shot; use resolvemount:<mount>:notlaunched|departed|unknown."); return; }
-        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
-        SetWelders(mount, false);
+        if (safeStartupShutdown)
+        {
+            foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+            SetWelders(mount, false);
+        }
         mount.State = MountState.Empty;
         mount.LoadedType = null;
         mount.BuildOrdered = false;
@@ -1608,8 +1706,7 @@ void ProcessCommand(string arg)
         if (!CanClearDoorFault(out reason)) { Echo("cleardoorfault rejected: " + reason); return; }
         launchSafetyFault = false;
         launchSafetyFaultReason = "";
-        siloState = AllConstructionDoorsClosed() ? SiloState.Idle : SiloState.OpeningDoors;
-        siloStateTick = tickCounter;
+        ResumeAfterDoorFault();
         Echo("Door fault cleared after live validation.");
         return;
     }
@@ -1664,7 +1761,7 @@ void UpdateLaunchPanel()
     sb.AppendLine($"ID:     {ndsId}");
     sb.AppendLine($"Hub:    {(hubAddressReceived ? "LINKED" : "SEARCHING")}");
     sb.AppendLine($"Operational: {(CanAcceptMissionsNow() ? "YES" : "NO")}");
-    sb.AppendLine($"Shared: {sharedInfrastructureStatus}");
+    sb.AppendLine($"Shared: {(SharedDoorsHardwareOk() && PrelaunchTimerReady() ? "OK" : "FAULT")}");
     sb.AppendLine($"Serviceable Mounts: {mounts.Count(m => IsServiceableMount(m))}/{mounts.Count}");
     sb.AppendLine($"Silo:   {siloState}");
     if (launchSafetyFault) sb.AppendLine($"DoorFault: {launchSafetyFaultReason}");
