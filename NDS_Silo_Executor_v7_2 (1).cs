@@ -23,26 +23,26 @@
 //   A TargetMission carries an ORDERED list of MissionSteps.
 //   Each step has a type, a count, and a fired counter.
 //
-// READY DETECTION (v7.2 fix):
-//   The projector is the PRIMARY teller for "is a build finished" —
-//   RemainingBlocks == 0 is trusted on its own, regardless of whether the
-//   projector is currently Enabled. A correctly-finished build gets disabled
-//   by this script as part of normal operation, so requiring Enabled here
-//   would make every already-built mount misread as Empty on the very next
-//   scan or recompile — which is exactly the bug this version fixes.
+// READY DETECTION / BUILD-ON-COMMAND:
+//   Empty is a healthy operational state. Projector RemainingBlocks == 0 is
+//   NEVER treated as proof that a missile exists at startup. The script only
+//   marks LaunchReady after it intentionally started a build and watched that
+//   build complete, or after persisted Storage plus merge verification proves
+//   the same safe state after a reload.
 //
-//   If a mount has a "<name> Merge" group configured, a connected merge
-//   block there is the FINAL VERIFICATION — hardware-level proof something
-//   real is physically attached, used as the tie-breaker if the projector's
-//   read alone is ambiguous. Mounts with no merge group configured fall back
-//   to trusting the projector's read on its own.
+//   If a mount has a "<name> Merge" group configured, a connected merge block
+//   is the physical-presence authority. Mounts without merge verification are
+//   supported, but after reload they rely on persisted script state and should
+//   be considered less reliable than merge-verified mounts.
 //
 // MANUAL BUILD (v7.2 addition):
 //   build:<mount>:<type>   — force one specific Empty mount to start
 //                            building <type> immediately, independent of
 //                            anything in the mission queue.
 //   buildall:<type>        — same, applied to every currently-Empty mount.
-//   Useful for pre-stocking inventory before any target order arrives.
+//   resetmount:<mount>     — operator recovery for FaultedLoaded/unknown
+//                            occupied states after physically clearing bay.
+//   Manual builds stop at LaunchReady and never launch without a mission.
 // =====================================================
 
 
@@ -108,8 +108,10 @@ const string STATUS_LCD_NAME    = "Silo Status LCD";  // NEW: For persistent sta
 // ── TIMING (Update10 ticks, ~0.167s each) ─────────────
 const int TICKS_DOOR_OPEN    = 60;
 const int TICKS_PRELAUNCH    = 60;
-const int TICKS_POST_LAUNCH  = 180;
+const int TICKS_POST_LAUNCH  = 180;   // legacy fallback; kept for operator familiarity
 const int TICKS_BUILD_CHECK  = 30;
+const int TICKS_SEPARATION_TIMEOUT = 360;
+const int TICKS_POST_SEPARATION_HOLD = 60;
 
 
 // ── PARALLEL STEP LIMIT ───────────────────────────────
@@ -137,7 +139,7 @@ int messageId   = 0;
 
 
 // ── MOUNT STATE ───────────────────────────────────────
-enum MountState { Empty, Building, Ready, Cooling }
+enum MountState { Unavailable, Empty, Building, LaunchReady, Launching, PostLaunch, FaultedLoaded }
 
 class MissileMount
 {
@@ -145,6 +147,11 @@ class MissileMount
     public MountState  State      = MountState.Empty;
     public MissileType? LoadedType = null;
     public int         StateTick  = 0;
+    public bool        BuildOrdered = false;
+    public bool        ManualBuild = false;
+    public MissionStep LaunchStep = null;
+    public string      FaultReason = "";
+    public string      ValidationStatus = "Not scanned";
 
     public IMyProgrammableBlock                   PB;
     public Dictionary<MissileType, IMyProjector>   Projectors = new Dictionary<MissileType, IMyProjector>();
@@ -158,10 +165,15 @@ class MissileMount
 
     public bool PBValid => PB != null && PB.IsFunctional;
 
-    public bool IsReadyWith(MissileType type) =>
-        State == MountState.Ready && LoadedType == type && PBValid;
+    public bool IsUsable { get { return State != MountState.Unavailable && PBValid && FunctionalWelderCount > 0 && Projectors.Count > 0; } }
 
-    public bool CanAcceptBuild => State == MountState.Empty;
+    public int FunctionalWelderCount { get { return Welders.Count(w => w.IsFunctional); } }
+
+    public bool IsReadyWith(MissileType type) { return State == MountState.LaunchReady && LoadedType == type && PBValid; }
+
+    public bool CanAcceptBuild { get { return State == MountState.Empty && IsUsable; } }
+
+    public bool Supports(MissileType type) { return IsUsable && Projectors.ContainsKey(type) && Projectors[type] != null && Projectors[type].IsFunctional; }
 
     // Whether this mount even uses the merge-verification convention at all.
     public bool HasMergeConvention => MergeBlocks.Count > 0;
@@ -173,7 +185,9 @@ class MissileMount
 
 List<MissileMount> mounts = new List<MissileMount>();
 List<string> debugErrors = new List<string>();
-bool isReadyForOperation = false;  // NEW: Track if silo can safely launch
+bool isReadyForOperation = false;  // installation operational; does not require loaded missiles
+bool sharedInfrastructureValid = false;
+string sharedInfrastructureStatus = "Not validated";
 
 
 // ── MISSION MODEL ─────────────────────────────────────
@@ -183,7 +197,9 @@ class MissionStep
     public MissileType Type;
     public int Count;
     public int Fired;
-    public bool Complete => Fired >= Count;
+    public string Status = "Queued";
+    public string BlockReason = "";
+    public bool Complete { get { return Fired >= Count; } }
 }
 
 class TargetMission
@@ -215,7 +231,8 @@ public Program()
         ndsId = Me.CubeGrid.EntityId.ToString();
 
     FindAllMountBlocks();
-    ValidateRequiredBlocks();  // NEW: Validate before allowing operation
+    LoadMountStorage();
+    ValidateRequiredBlocks();  // validates shared infrastructure plus at least one usable mount
     PrintStatus();
 }
 
@@ -227,10 +244,10 @@ public void Main(string argument, UpdateType updateSource)
 
     if ((updateSource & UpdateType.Update10) != 0)
     {
-        if (hubAddressReceived && isReadyForOperation)  // NEW: Only run if validated
+        if (hubAddressReceived)
         {
             SendStatusToHub();
-            CheckForIncomingMessages();
+            if (isReadyForOperation) CheckForIncomingMessages();
         }
         RunMountStates();
         RunSiloLogic();
@@ -240,36 +257,49 @@ public void Main(string argument, UpdateType updateSource)
 }
 
 
-// ── VALIDATION (NEW) ──────────────────────────────────
+// ── VALIDATION ──────────────────────────────────────
 
 bool ValidateRequiredBlocks()
 {
-    // NEW: Check for critical blocks on startup
+    debugErrors.Add("-------------------------------------");
     var criticalErrors = new List<string>();
-    
+
     var doorGroup = GridTerminalSystem.GetBlockGroupWithName(SHARED_DOOR_GROUP);
     if (doorGroup == null)
-        criticalErrors.Add($"CRITICAL: Shared Door Group '{SHARED_DOOR_GROUP}' not found! Launches will hang.");
-    
-    var prelaunchTimer = GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER);
-    if (prelaunchTimer == null)
-        criticalErrors.Add($"CRITICAL: Prelaunch Timer '{PRELAUNCH_TIMER}' not found! Launches will stall.");
-    
-    if (criticalErrors.Count > 0)
+        criticalErrors.Add("Shared Door Group '" + SHARED_DOOR_GROUP + "' not found");
+
+    var prelaunchTimer = GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER) as IMyTimerBlock;
+    if (prelaunchTimer == null || !prelaunchTimer.IsFunctional)
+        criticalErrors.Add("Prelaunch Timer '" + PRELAUNCH_TIMER + "' missing or not functional");
+
+    sharedInfrastructureValid = criticalErrors.Count == 0;
+    sharedInfrastructureStatus = sharedInfrastructureValid ? "OK" : string.Join("; ", criticalErrors.ToArray());
+
+    int usable = mounts.Count(m => m.IsUsable);
+    isReadyForOperation = sharedInfrastructureValid && usable > 0;
+
+    if (!sharedInfrastructureValid)
+    {
+        debugErrors.Insert(0, "╔════ STARTUP VALIDATION FAILED ════╗");
+        foreach (var err in criticalErrors) debugErrors.Insert(1, "CRITICAL: " + err);
+        debugErrors.Insert(2, "FIX: Create missing shared launch blocks or rename existing ones.");
+        debugErrors.Insert(3, "════════════════════════════════════");
+    }
+    else if (usable == 0)
     {
         isReadyForOperation = false;
         debugErrors.Insert(0, "╔════ STARTUP VALIDATION FAILED ════╗");
-        foreach (var err in criticalErrors)
-            debugErrors.Insert(1, err);
-        debugErrors.Insert(2, "FIX: Create missing blocks or rename existing ones.");
+        debugErrors.Insert(1, "CRITICAL: Zero usable missile mounts.");
+        debugErrors.Insert(2, "FIX: Repair at least one mount PB, welder group, and projector.");
         debugErrors.Insert(3, "════════════════════════════════════");
-        Echo("SILO STARTUP FAILED - Check debug panel");
-        return false;
     }
-    
-    isReadyForOperation = true;
-    debugErrors.Insert(0, "✓ All required blocks validated. Ready for operation.");
-    return true;
+    else
+    {
+        debugErrors.Insert(0, "✓ Silo Operational: YES. Usable Mounts: " + usable + "/" + mounts.Count + ". Empty silos are Ready.");
+    }
+
+    SaveMountStorage();
+    return isReadyForOperation;
 }
 
 
@@ -279,136 +309,144 @@ void FindAllMountBlocks()
 {
     mounts.Clear();
     debugErrors.Clear();
-    debugErrors.Add($"Last Scan: {DateTime.Now.ToString("HH:mm:ss")}");
-    debugErrors.Add($"Subgrid Support: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
-    debugErrors.Add("-------------------------------------");
-
-    if (GridTerminalSystem.GetBlockGroupWithName(SHARED_DOOR_GROUP) == null)
-        debugErrors.Add($"[INFO] Shared Door Group '{SHARED_DOOR_GROUP}' not found. (Safe to ignore if no silo doors).");
-
-    if (GridTerminalSystem.GetBlockWithName(PRELAUNCH_TIMER) == null)
-        debugErrors.Add($"[ERROR] Shared Timer '{PRELAUNCH_TIMER}' not found! (Launch sequence will stall).");
-
-    if (GridTerminalSystem.GetBlockWithName(LAUNCH_PANEL_NAME) == null)
-        debugErrors.Add($"[WARNING] Main LCD '{LAUNCH_PANEL_NAME}' not found. (Optional telemetry).");
-
+    debugErrors.Add("Last Scan: " + DateTime.Now.ToString("HH:mm:ss"));
+    debugErrors.Add("Subgrid Support: " + (allowSubgrids ? "ENABLED" : "DISABLED"));
+    debugErrors.Add("Merge verification: recommended physical-presence authority; non-merge mounts use persisted build state only.");
     debugErrors.Add("-------------------------------------");
 
     foreach (string name in MISSILE_MANIFEST)
     {
-        var mount    = new MissileMount { Name = name };
+        var mount = new MissileMount { Name = name };
         string lName = name.ToLower();
-        bool bayHasErrors = false;
+        var reasons = new List<string>();
 
-        // PB Check
         var pbs = new List<IMyProgrammableBlock>();
         GridTerminalSystem.GetBlocksOfType(pbs, b =>
-            (allowSubgrids || b.CubeGrid == Me.CubeGrid) && b != Me &&
+            (allowSubgrids || b.CubeGrid == Me.CubeGrid) && b != Me && b.IsFunctional &&
             b.CustomName.ToLower().Contains(lName) &&
             b.CustomName.ToLower().Contains(PB_SUFFIX.ToLower().Trim()));
-        if (pbs.Count > 0) mount.PB = pbs[0];
-        else { debugErrors.Add($"[{name}] ERROR: Missing PB '{name}{PB_SUFFIX}'"); bayHasErrors = true; }
+        if (pbs.Count > 0) mount.PB = pbs[0]; else reasons.Add("missing missile PB");
 
-        // Projector Checks
-        // v7.2 FIX: do NOT force-disable found projectors here. Doing so
-        // before state detection runs (below) destroys the only signal
-        // available for telling an already-built or in-progress mount
-        // apart from a genuinely empty one — every projector would read
-        // Enabled=false the instant it's found, which is exactly the bug
-        // that made every mount misreport as Empty on every scan.
         foreach (MissileType mtype in ALL_TYPES)
         {
             string suffix = PROJECTOR_SUFFIX[mtype];
             var projs = new List<IMyProjector>();
             GridTerminalSystem.GetBlocksOfType(projs, b =>
-                (allowSubgrids || b.CubeGrid == Me.CubeGrid) &&
+                (allowSubgrids || b.CubeGrid == Me.CubeGrid) && b.IsFunctional &&
                 b.CustomName.ToLower().Contains(lName) &&
                 b.CustomName.ToLower().Contains(suffix.ToLower().Trim()));
-            if (projs.Count > 0)
-            {
-                mount.Projectors[mtype] = projs[0];
-                // No forced Enabled change here — left exactly as found.
-            }
-            else { debugErrors.Add($"[{name}] ERROR: Missing Projector '{name}{suffix}'"); bayHasErrors = true; }
+            if (projs.Count > 0) mount.Projectors[mtype] = projs[0];
+            else debugErrors.Add("[" + name + "] Capability missing: " + TYPE_CODE[mtype] + " projector");
         }
+        if (mount.Projectors.Count == 0) reasons.Add("no valid missile-type projectors");
 
-        // Welder Group Check
         var wg = GridTerminalSystem.GetBlockGroupWithName(name + WELDER_GROUP_SUF);
-        if (wg != null)
-        {
-            wg.GetBlocksOfType(mount.Welders);
-            if (mount.Welders.Count == 0)
-            { debugErrors.Add($"[{name}] ERROR: Welder Group '{name}{WELDER_GROUP_SUF}' is empty!"); bayHasErrors = true; }
-        }
-        else { debugErrors.Add($"[{name}] ERROR: Missing Welder Group '{name}{WELDER_GROUP_SUF}'"); bayHasErrors = true; }
+        if (wg != null) wg.GetBlocksOfType(mount.Welders, w => w.IsFunctional);
+        if (mount.Welders.Count == 0) reasons.Add("missing functional welders");
 
-        // Door Group Check (optional)
         var dg = GridTerminalSystem.GetBlockGroupWithName(name + DOOR_GROUP_SUF);
-        if (dg != null) dg.GetBlocksOfType(mount.Doors);
+        if (dg != null) dg.GetBlocksOfType(mount.Doors, d => d.IsFunctional);
 
-        // Merge Group Check (optional — used as final verification for Ready detection)
         var mg = GridTerminalSystem.GetBlockGroupWithName(name + MERGE_GROUP_SUF);
-        if (mg != null)
+        if (mg != null) mg.GetBlocksOfType(mount.MergeBlocks, m => m.IsFunctional);
+
+        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+        SetWelders(mount, false);
+
+        if (reasons.Count > 0)
         {
-            mg.GetBlocksOfType(mount.MergeBlocks);
-            debugErrors.Add($"[{name}] INFO: Merge verification enabled ({mount.MergeBlocks.Count} block(s)).");
+            mount.State = MountState.Unavailable;
+            mount.ValidationStatus = "Unavailable — " + string.Join(", ", reasons.ToArray());
         }
-
-        // ── READY / BUILDING DETECTION (v7.2 fix) ────────────────────────
-        // Projector is the primary teller: RemainingBlocks == 0 means done,
-        // checked regardless of Enabled. If a merge convention is configured
-        // for this mount, a connected merge block has final say — it must
-        // also confirm before a "done" read is trusted as Ready.
-        mount.State      = MountState.Empty;
-        mount.LoadedType = null;
-
-        bool mergeConfirms = mount.HasMergeConvention && mount.MergeConfirmsPresent;
-
-        foreach (MissileType mtype in ALL_TYPES)
+        else
         {
-            IMyProjector proj;
-            if (!mount.Projectors.TryGetValue(mtype, out proj)) continue;
-
-            if (proj.Enabled && proj.RemainingBlocks > 0)
-            {
-                mount.State = MountState.Building; mount.LoadedType = mtype; break;
-            }
-
-            if (proj.RemainingBlocks == 0)
-            {
-                // Mount has a merge group but it isn't currently connected —
-                // don't trust the projector's read in isolation. Skip this
-                // type and keep looking; if nothing else matches, the mount
-                // correctly falls through to Empty.
-                if (mount.HasMergeConvention && !mergeConfirms) continue;
-
-                proj.Enabled = false;
-                SetWelders(mount, false);
-                mount.State = MountState.Ready; mount.LoadedType = mtype;
-                break;
-            }
+            mount.State = MountState.Empty;
+            mount.ValidationStatus = "Usable";
         }
-
-        if (mount.State == MountState.Empty && mergeConfirms)
-            debugErrors.Add($"[{name}] WARNING: Merge shows occupied but no projector confirmed a type — verify manually.");
 
         mounts.Add(mount);
-
-        if (!bayHasErrors)
-            debugErrors.Add($"[{name}] OK - All blocks found and linked. State={mount.State}" +
-                            (mount.LoadedType.HasValue ? $" [{TYPE_CODE[mount.LoadedType.Value]}]" : ""));
-
+        debugErrors.Add("[" + name + "] " + mount.ValidationStatus);
+        debugErrors.Add("  Supports: " + SupportedTypesText(mount));
+        debugErrors.Add("  Merge verification: " + (mount.HasMergeConvention ? (mount.MergeConfirmsPresent ? "CONNECTED" : "configured/disconnected") : "not configured"));
         debugErrors.Add(" ");
     }
 }
 
 void PrintStatus()
 {
-    Echo($"NDS Silo {ndsId} — {mounts.Count} mounts, parallel limit {MAX_PARALLEL_STEP_TYPES}");
-    Echo($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
-    Echo($"Ready for Operation: {(isReadyForOperation ? "YES" : "NO - FIX BLOCKS FIRST")}");
+    Echo("NDS Silo " + ndsId + " — " + mounts.Count + " mounts, parallel limit " + MAX_PARALLEL_STEP_TYPES);
+    Echo("Operational: " + (isReadyForOperation ? "YES" : "NO") + " Shared=" + sharedInfrastructureStatus);
+    Echo("Usable Mounts: " + mounts.Count(m => m.IsUsable) + "/" + mounts.Count);
     foreach (var m in mounts)
-        Echo($"  {m.Name}: PB={m.PBValid} Proj={m.Projectors.Count}/5 Welders={m.Welders.Count} State={m.State}");
+        Echo("  " + m.Name + ": " + m.State + " " + m.ValidationStatus + " Supports=" + SupportedTypesText(m));
+}
+
+string SupportedTypesText(MissileMount mount)
+{
+    var codes = new List<string>();
+    foreach (MissileType t in ALL_TYPES) if (mount.Supports(t)) codes.Add(TYPE_CODE[t]);
+    return codes.Count == 0 ? "NONE" : string.Join(" ", codes.ToArray());
+}
+
+// ── PERSISTED MOUNT STATE ───────────────────────────
+
+void LoadMountStorage()
+{
+    var lines = string.IsNullOrWhiteSpace(Storage)
+        ? new string[0]
+        : Storage.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+    foreach (string raw in lines)
+    {
+        var parts = raw.Split('|');
+        if (parts.Length < 4 || parts[0] != "M") continue;
+        var mount = mounts.FirstOrDefault(m => m.Name.Equals(parts[1], StringComparison.OrdinalIgnoreCase));
+        if (mount == null || mount.State == MountState.Unavailable) continue;
+        MountState st;
+        MissileType mt;
+        bool hasType = TryParseType(parts[3], out mt);
+        bool ordered = parts.Length > 4 && parts[4] == "1";
+        if (!Enum.TryParse(parts[2], out st)) continue;
+
+        if ((st == MountState.Building || st == MountState.LaunchReady || st == MountState.Launching || st == MountState.PostLaunch || st == MountState.FaultedLoaded) && hasType)
+        {
+            if (mount.HasMergeConvention)
+            {
+                if (mount.MergeConfirmsPresent || st == MountState.Building)
+                { mount.State = st; mount.LoadedType = mt; mount.BuildOrdered = ordered; }
+                else
+                { mount.State = MountState.Empty; mount.LoadedType = null; }
+            }
+            else if (ordered)
+            {
+                mount.State = st; mount.LoadedType = mt; mount.BuildOrdered = true;
+                if (st == MountState.LaunchReady) mount.FaultReason = "No merge verification; readiness restored from Storage, not projector RemainingBlocks alone.";
+            }
+            else
+            {
+                mount.State = MountState.Empty; mount.LoadedType = null;
+            }
+        }
+    }
+    foreach (var mount in mounts)
+    {
+        if (mount.State == MountState.Empty && mount.HasMergeConvention && mount.MergeConfirmsPresent)
+        {
+            mount.State = MountState.FaultedLoaded;
+            mount.FaultReason = "Merge indicates a physical missile/object is present, but persisted loaded type is unknown.";
+        }
+    }
+}
+
+void SaveMountStorage()
+{
+    var sb = new System.Text.StringBuilder();
+    foreach (var m in mounts)
+    {
+        sb.Append("M|").Append(m.Name).Append("|").Append(m.State).Append("|")
+          .Append(m.LoadedType.HasValue ? m.LoadedType.Value.ToString() : "None").Append("|")
+          .Append(m.BuildOrdered ? "1" : "0").Append("\n");
+    }
+    Storage = sb.ToString();
 }
 
 
@@ -423,42 +461,78 @@ void RunMountStates()
             case MountState.Building:
                 RunBuildState(mount);
                 break;
-            case MountState.Cooling:
-                if (tickCounter - mount.StateTick >= TICKS_POST_LAUNCH)
-                {
-                    ReScanPB(mount);
-                    SetWelders(mount, false);
-                    mount.State      = MountState.Empty;
-                    mount.LoadedType = null;
-                }
+            case MountState.Launching:
+                RunLaunchingState(mount);
+                break;
+            case MountState.PostLaunch:
+                RunPostLaunchState(mount);
                 break;
         }
     }
+    SaveMountStorage();
 }
 
 void RunBuildState(MissileMount mount)
 {
     if (tickCounter % TICKS_BUILD_CHECK != 0) return;
-    if (!mount.LoadedType.HasValue) return;
+    if (!mount.LoadedType.HasValue) { FaultMount(mount, "Build has no missile type"); return; }
 
     var proj = mount.ActiveProjector;
-    if (proj == null) { mount.State = MountState.Empty; mount.LoadedType = null; return; }
+    if (proj == null || !proj.IsFunctional) { FaultMount(mount, "Build projector missing or nonfunctional"); return; }
 
-    if (!proj.Enabled) proj.Enabled = true;
+    proj.Enabled = true;
     SetWelders(mount, true);
 
     if (proj.RemainingBlocks == 0)
     {
-        // Same primary/final-verification rule applies here as in the
-        // initial scan: projector says done, merge (if configured) gets
-        // final say before we commit to Ready.
         if (mount.HasMergeConvention && !mount.MergeConfirmsPresent) return;
-
         proj.Enabled = false;
         SetWelders(mount, false);
-        mount.State = MountState.Ready;
-        Echo($"{mount.Name} [{TYPE_CODE[mount.LoadedType.Value]}] READY");
+        mount.State = MountState.LaunchReady;
+        mount.FaultReason = mount.HasMergeConvention ? "" : "Ready from intentional completed build; add merge blocks for reliable physical confirmation.";
+        Echo(mount.Name + " [" + TYPE_CODE[mount.LoadedType.Value] + "] LAUNCH READY");
     }
+}
+
+void RunLaunchingState(MissileMount mount)
+{
+    bool separated = mount.HasMergeConvention ? !mount.MergeConfirmsPresent : (tickCounter - mount.StateTick >= TICKS_POST_LAUNCH);
+    if (separated)
+    {
+        mount.State = MountState.PostLaunch;
+        mount.StateTick = tickCounter;
+        if (mount.LaunchStep != null) mount.LaunchStep.Fired++;
+        Echo(mount.Name + " separation confirmed; holding doors open.");
+        return;
+    }
+    if (tickCounter - mount.StateTick > TICKS_SEPARATION_TIMEOUT)
+    {
+        FaultMount(mount, "SEPARATION TIMEOUT - missile still present");
+    }
+}
+
+void RunPostLaunchState(MissileMount mount)
+{
+    if (tickCounter - mount.StateTick < TICKS_POST_SEPARATION_HOLD) return;
+    foreach (var door in mount.Doors) door.CloseDoor();
+    foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+    SetWelders(mount, false);
+    mount.State = MountState.Empty;
+    mount.LoadedType = null;
+    mount.BuildOrdered = false;
+    mount.ManualBuild = false;
+    mount.LaunchStep = null;
+    mount.FaultReason = "";
+}
+
+void FaultMount(MissileMount mount, string reason)
+{
+    mount.State = MountState.FaultedLoaded;
+    mount.FaultReason = reason;
+    SetWelders(mount, false);
+    foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+    debugErrors.Insert(0, "[" + mount.Name + "] LAUNCH/LOAD FAULT: " + reason);
+    Echo(mount.Name + ": LAUNCH FAULT - Missile still present - " + reason);
 }
 
 void ReScanPB(MissileMount mount)
@@ -477,7 +551,6 @@ void SetWelders(MissileMount mount, bool on)
         if (w.IsFunctional || !on) w.Enabled = on;
 }
 
-
 // ── ACTIVE STEP WINDOW ────────────────────────────────
 List<MissionStep> GetActiveSteps(TargetMission mission)
 {
@@ -490,15 +563,19 @@ List<MissionStep> GetActiveSteps(TargetMission mission)
 
 void RunSiloLogic()
 {
-    bool anyOrders = missionQueue.Count > 0;
+    AssignBuilds();
+    UpdateMissionBlocks();
+
+    bool launching = mounts.Any(m => m.State == MountState.Launching || m.State == MountState.PostLaunch);
+    bool readyForMission = missionQueue.Count > 0 && mounts.Any(m => m.State == MountState.LaunchReady && !m.ManualBuild);
 
     switch (siloState)
     {
         case SiloState.Idle:
-            if (anyOrders)
+            if (readyForMission || launching)
             {
                 OpenSharedDoors();
-                siloState     = SiloState.OpeningDoors;
+                siloState = SiloState.OpeningDoors;
                 siloStateTick = tickCounter;
             }
             break;
@@ -507,135 +584,171 @@ void RunSiloLogic()
             if (tickCounter - siloStateTick >= TICKS_DOOR_OPEN)
             {
                 TriggerPreLaunchTimer();
-                siloState     = SiloState.PreLaunch;
+                siloState = SiloState.PreLaunch;
                 siloStateTick = tickCounter;
             }
             break;
 
         case SiloState.PreLaunch:
             if (tickCounter - siloStateTick >= TICKS_PRELAUNCH)
+            {
                 siloState = SiloState.Active;
+                siloStateTick = tickCounter;
+            }
             break;
 
         case SiloState.Active:
-            AssignBuilds();
             AttemptFires();
-            if (missionQueue.Count == 0)
+            if (!readyForMission && !launching)
             {
-                CloseSharedDoors();
-                siloState     = SiloState.ClosingDoors;
+                siloState = SiloState.ClosingDoors;
                 siloStateTick = tickCounter;
             }
             break;
 
         case SiloState.ClosingDoors:
-            if (tickCounter - siloStateTick >= TICKS_DOOR_OPEN)
+            if (readyForMission || launching)
+            {
+                OpenSharedDoors();
+                siloState = SiloState.OpeningDoors;
+                siloStateTick = tickCounter;
+            }
+            else if (tickCounter - siloStateTick >= TICKS_POST_SEPARATION_HOLD)
+            {
+                CloseSharedDoors();
                 siloState = SiloState.Idle;
+            }
             break;
     }
 }
 
 void AssignBuilds()
 {
-    if (missionQueue.Count == 0) return;
+    if (!isReadyForOperation || missionQueue.Count == 0) return;
     var mission = missionQueue[0];
-    var active  = GetActiveSteps(mission);
+    var active = GetActiveSteps(mission);
     if (active.Count == 0) return;
 
-    var needed   = new Dictionary<MissileType, int>();
-    var building = new Dictionary<MissileType, int>();
+    var needed = new Dictionary<MissileType, int>();
+    var allocated = new Dictionary<MissileType, int>();
     foreach (var step in active)
     {
         if (!needed.ContainsKey(step.Type)) needed[step.Type] = 0;
         needed[step.Type] += (step.Count - step.Fired);
     }
-    foreach (MissileType t in needed.Keys.ToList()) building[t] = 0;
+    foreach (MissileType t in needed.Keys.ToList()) allocated[t] = 0;
 
     foreach (var mount in mounts)
-        if ((mount.State == MountState.Building || mount.State == MountState.Ready)
-            && mount.LoadedType.HasValue && needed.ContainsKey(mount.LoadedType.Value))
-            building[mount.LoadedType.Value]++;
+        if ((mount.State == MountState.Building || mount.State == MountState.LaunchReady || mount.State == MountState.Launching || mount.State == MountState.PostLaunch)
+            && mount.LoadedType.HasValue && needed.ContainsKey(mount.LoadedType.Value) && !mount.ManualBuild)
+            allocated[mount.LoadedType.Value]++;
 
     foreach (var mount in mounts)
     {
         if (!mount.CanAcceptBuild) continue;
-
         MissileType? best = null;
         int bestShortfall = 0;
         foreach (var type in needed.Keys)
         {
-            if (!mount.Projectors.ContainsKey(type)) continue;
-            int shortfall = needed[type] - building[type];
+            if (!mount.Supports(type)) continue;
+            int shortfall = needed[type] - allocated[type];
             if (shortfall > bestShortfall) { bestShortfall = shortfall; best = type; }
         }
-
         if (best.HasValue)
         {
-            StartBuild(mount, best.Value);
-            building[best.Value]++;
+            StartBuild(mount, best.Value, false);
+            allocated[best.Value]++;
         }
     }
 }
 
-void StartBuild(MissileMount mount, MissileType type)
+void UpdateMissionBlocks()
 {
+    if (missionQueue.Count == 0) return;
+    var mission = missionQueue[0];
+    var active = GetActiveSteps(mission);
+    foreach (var step in active)
+    {
+        if (step.Complete) { step.Status = "Complete"; continue; }
+        if (!mounts.Any(m => m.Supports(step.Type)))
+        {
+            step.Status = "Blocked";
+            step.BlockReason = "Mission blocked: no usable mount supports " + TYPE_CODE[step.Type];
+            if (!debugErrors.Contains(step.BlockReason)) debugErrors.Insert(0, step.BlockReason);
+            continue;
+        }
+        if (mounts.Any(m => m.State == MountState.FaultedLoaded && m.LoadedType == step.Type)) step.Status = "Faulted";
+        else if (mounts.Any(m => m.State == MountState.Launching && m.LoadedType == step.Type)) step.Status = "Launching";
+        else if (mounts.Any(m => m.State == MountState.LaunchReady && m.LoadedType == step.Type && !m.ManualBuild)) step.Status = "LaunchReady";
+        else if (mounts.Any(m => m.State == MountState.Building && m.LoadedType == step.Type)) step.Status = "Building";
+        else step.Status = "Queued";
+    }
+}
+
+void StartBuild(MissileMount mount, MissileType type, bool manual)
+{
+    if (!mount.Supports(type)) { Echo("Cannot build " + TYPE_CODE[type] + " on " + mount.Name + ": unsupported."); return; }
     foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
     var proj = mount.Projectors[type];
-    proj.Enabled     = true;
+    proj.Enabled = true;
     mount.LoadedType = type;
-    mount.State      = MountState.Building;
-    mount.StateTick  = tickCounter;
+    mount.State = MountState.Building;
+    mount.StateTick = tickCounter;
+    mount.BuildOrdered = true;
+    mount.ManualBuild = manual;
+    mount.LaunchStep = null;
+    mount.FaultReason = "";
     SetWelders(mount, true);
-    Echo($"{mount.Name} building [{TYPE_CODE[type]}]");
+    SaveMountStorage();
+    Echo(mount.Name + " building [" + TYPE_CODE[type] + "]" + (manual ? " (manual)" : ""));
 }
 
 void AttemptFires()
 {
     if (missionQueue.Count == 0) return;
     var mission = missionQueue[0];
-    var active  = GetActiveSteps(mission);
+    var active = GetActiveSteps(mission);
     if (active.Count == 0)
     {
         if (mission.Complete)
         {
             missionQueue.RemoveAt(0);
-            Echo($"Mission complete: {ParseGPSName(mission.GPS)}");
+            Echo("Mission complete: " + ParseGPSName(mission.GPS));
         }
         return;
     }
 
     foreach (var mount in mounts)
     {
-        if (mount.State != MountState.Ready || !mount.LoadedType.HasValue) continue;
-
+        if (mount.State != MountState.LaunchReady || !mount.LoadedType.HasValue || mount.ManualBuild) continue;
         var step = active.FirstOrDefault(s => s.Type == mount.LoadedType.Value && !s.Complete);
         if (step == null) continue;
 
-        bool fired = mount.PB.TryRun(mission.GPS);
+        OpenSharedDoors();
+        foreach (var door in mount.Doors) door.OpenDoor();
+        bool fired = mount.PBValid && mount.PB.TryRun(mission.GPS);
         if (fired)
         {
-            step.Fired++;
-            mount.State     = MountState.Cooling;
+            mount.State = MountState.Launching;
             mount.StateTick = tickCounter;
-            foreach (var door in mount.Doors) door.OpenDoor();
-            Echo($"Fired {mount.Name} [{TYPE_CODE[mount.LoadedType.Value]}] → " +
-                 $"{ParseGPSName(mission.GPS)} ({step.Fired}/{step.Count})");
+            mount.LaunchStep = step;
+            step.Status = "Launching";
+            Echo("Started launch " + mount.Name + " [" + TYPE_CODE[mount.LoadedType.Value] + "] → " + ParseGPSName(mission.GPS));
         }
         else
         {
-            Echo($"{mount.Name} TryRun failed — resetting");
-            mount.State     = MountState.Cooling;
-            mount.StateTick = tickCounter;
+            FaultMount(mount, "TryRun failed");
+            step.Status = "Faulted";
+            step.BlockReason = mount.Name + ": LAUNCH FAULT - TryRun failed; missile still present";
         }
     }
 
-    if (mission.Complete)
+    if (mission.Complete && !mounts.Any(m => m.State == MountState.Launching || m.State == MountState.PostLaunch))
     {
         missionQueue.RemoveAt(0);
-        Echo($"Mission complete: {ParseGPSName(mission.GPS)}");
+        Echo("Mission complete: " + ParseGPSName(mission.GPS));
     }
 }
-
 
 // ── DOOR CONTROL ──────────────────────────────────────
 
@@ -676,10 +789,10 @@ void CheckForHubAddress()
 void SendStatusToHub()
 {
     if (tickCounter % 300 != 0) return;
-    int empty    = mounts.Count(m => m.State == MountState.Empty);
+    int empty    = mounts.Count(m => m.State == MountState.Empty && m.IsUsable);
     int building = mounts.Count(m => m.State == MountState.Building);
-    int ready    = mounts.Count(m => m.State == MountState.Ready);
-    string status = (siloState == SiloState.Idle && ready > 0) ? "Ready" : "Busy";
+    int ready    = mounts.Count(m => m.State == MountState.LaunchReady);
+    string status = isReadyForOperation ? "Ready" : "Busy";
     string payload = $"{sharedSecret}:{ndsId}:{messageId}:Status:{status}:{empty}:{building}:{ready}";
     IGC.SendUnicastMessage(hubAddress, hubChannelTag, payload);
     messageId++;
@@ -817,8 +930,8 @@ void ProcessCommand(string arg)
         int started = 0;
         foreach (var mount in mounts)
         {
-            if (mount.CanAcceptBuild && mount.Projectors.ContainsKey(type))
-            { StartBuild(mount, type); started++; }
+            if (mount.CanAcceptBuild && mount.Supports(type))
+            { StartBuild(mount, type, true); started++; }
         }
         Echo($"buildall [{TYPE_CODE[type]}]: started {started} mount(s).");
         return;
@@ -843,11 +956,31 @@ void ProcessCommand(string arg)
 
         if (!mount.CanAcceptBuild)
         { Echo($"build: {mount.Name} is not Empty (currently {mount.State}) — cannot start a manual build."); return; }
-        if (!mount.Projectors.ContainsKey(type))
-        { Echo($"build: {mount.Name} has no {TYPE_CODE[type]} projector."); return; }
+        if (!mount.Supports(type))
+        { Echo($"build: {mount.Name} does not support {TYPE_CODE[type]}."); return; }
 
-        StartBuild(mount, type);
+        StartBuild(mount, type, true);
         Echo($"Manual build started: {mount.Name} → [{TYPE_CODE[type]}]");
+        return;
+    }
+
+
+    if (l.StartsWith("resetmount:"))
+    {
+        string mountName = arg.Substring(11).Trim();
+        var mount = mounts.FirstOrDefault(m => m.Name.Equals(mountName, StringComparison.OrdinalIgnoreCase));
+        if (mount == null) { Echo("resetmount: unknown mount '" + mountName + "'"); return; }
+        if (mount.State == MountState.Unavailable) { Echo("resetmount: " + mount.Name + " is unavailable; run refresh after repairs."); return; }
+        foreach (var kv in mount.Projectors) kv.Value.Enabled = false;
+        SetWelders(mount, false);
+        mount.State = MountState.Empty;
+        mount.LoadedType = null;
+        mount.BuildOrdered = false;
+        mount.ManualBuild = false;
+        mount.LaunchStep = null;
+        mount.FaultReason = "Reset by operator. Verify bay is physically empty before rebuilding.";
+        SaveMountStorage();
+        Echo("resetmount: " + mount.Name + " set to Empty. Verify physical bay is clear.");
         return;
     }
 
@@ -897,7 +1030,9 @@ void UpdateLaunchPanel()
     sb.AppendLine("=== NDS SILO ===");
     sb.AppendLine($"ID:     {ndsId}");
     sb.AppendLine($"Hub:    {(hubAddressReceived ? "LINKED" : "SEARCHING")}");
-    sb.AppendLine($"Ready:  {(isReadyForOperation ? "YES" : "NO - FIX BLOCKS")}");
+    sb.AppendLine($"Operational: {(isReadyForOperation ? "YES" : "NO")}");
+    sb.AppendLine($"Shared: {sharedInfrastructureStatus}");
+    sb.AppendLine($"Usable Mounts: {mounts.Count(m => m.IsUsable)}/{mounts.Count}");
     sb.AppendLine($"Silo:   {siloState}");
     sb.AppendLine($"Limit:  {MAX_PARALLEL_STEP_TYPES} parallel types");
     sb.AppendLine($"Subgrids: {(allowSubgrids ? "ENABLED" : "DISABLED")}");
@@ -909,8 +1044,10 @@ void UpdateLaunchPanel()
         string typeStr  = m.LoadedType.HasValue ? $"[{TYPE_CODE[m.LoadedType.Value]}]" : "[empty]";
         int    rem      = (m.ActiveProjector != null) ? m.ActiveProjector.RemainingBlocks : 0;
         string remStr   = m.State == MountState.Building ? $" {rem}blk" : "";
-        string mergeStr = m.HasMergeConvention ? (m.MergeConfirmsPresent ? " [merge:OK]" : " [merge:--]") : "";
+        string mergeStr = m.HasMergeConvention ? (m.MergeConfirmsPresent ? " [merge:CONNECTED]" : " [merge:DISCONNECTED]") : " [merge:not configured]";
         sb.AppendLine($"{m.Name}: {m.State.ToString().ToUpper()} {typeStr}{remStr}{mergeStr}");
+        sb.AppendLine($"  Supports: {SupportedTypesText(m)}");
+        if (!string.IsNullOrEmpty(m.FaultReason)) sb.AppendLine($"  Fault/Note: {m.FaultReason}");
     }
 
     if (missionQueue.Count > 0)
@@ -922,8 +1059,9 @@ void UpdateLaunchPanel()
         sb.AppendLine($"── Mission: {ParseGPSName(missionQueue[0].GPS)} ──");
         foreach (var s in missionQueue[0].Steps)
         {
-            string tag = s.Complete ? "[done]" : (activeSet.Contains(s) ? "[active]" : "[queued]");
-            sb.AppendLine($"{TYPE_CODE[s.Type]} {s.Fired}/{s.Count} {tag}");
+            string tag = s.Complete ? "Complete" : (activeSet.Contains(s) ? s.Status : "Queued");
+            sb.AppendLine($"{TYPE_CODE[s.Type]} {s.Fired}/{s.Count} [{tag}]");
+            if (!string.IsNullOrEmpty(s.BlockReason)) sb.AppendLine("  " + s.BlockReason);
         }
 
         if (missionQueue.Count > 1)
